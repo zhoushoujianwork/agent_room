@@ -1,0 +1,194 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"agent-room/internal/models"
+)
+
+// migrate creates or upgrades all tables this app owns. It is split
+// out from Open so tests can call it twice in a row to verify
+// idempotency (the design contract calls this out explicitly). Every
+// statement here uses IF NOT EXISTS so re-running is safe.
+func migrate(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS messages (
+            seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              TEXT    NOT NULL UNIQUE,
+            room_id         TEXT    NOT NULL,
+            type            TEXT    NOT NULL DEFAULT '',
+            sender_id       TEXT    NOT NULL DEFAULT '',
+            sender_kind     TEXT    NOT NULL DEFAULT '',
+            target_id       TEXT    NOT NULL DEFAULT '',
+            content         TEXT    NOT NULL DEFAULT '',
+            reply_requested INTEGER NOT NULL DEFAULT 0,
+            turn_budget     INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT    NOT NULL,
+            metadata_json   TEXT    NOT NULL DEFAULT '{}'
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);`,
+		`CREATE TABLE IF NOT EXISTS rooms (
+            id           TEXT PRIMARY KEY,
+            owner_login  TEXT NULL,
+            title        TEXT NULL,
+            gated        INTEGER NOT NULL DEFAULT 0,
+            ended        INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL
+        );`,
+		`CREATE TABLE IF NOT EXISTS access_requests (
+            id               TEXT PRIMARY KEY,
+            room_id          TEXT NOT NULL,
+            requester_login  TEXT NULL,
+            requester_anonid TEXT NULL,
+            requester_label  TEXT NOT NULL,
+            via              TEXT NOT NULL,
+            location         TEXT NULL,
+            status           TEXT NOT NULL,
+            persistence      TEXT NULL,
+            created_at       TEXT NOT NULL,
+            resolved_at      TEXT NULL,
+            FOREIGN KEY (room_id) REFERENCES rooms(id)
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_access_requests_room ON access_requests(room_id, status);`,
+		`CREATE TABLE IF NOT EXISTS attachments (
+            id         TEXT PRIMARY KEY,
+            room_id    TEXT NOT NULL,
+            mime       TEXT NOT NULL,
+            size       INTEGER NOT NULL DEFAULT 0,
+            bytes      BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_attachments_room ON attachments(room_id);`,
+		`CREATE TABLE IF NOT EXISTS room_summaries (
+            room_id     TEXT PRIMARY KEY,
+            summary     TEXT NOT NULL DEFAULT '',
+            covered_seq INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL
+        );`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("sqlite migrate: %w", err)
+		}
+	}
+	return nil
+}
+
+type Store struct {
+	db *sql.DB
+}
+
+// Open returns a SQLite-backed MessageStore at the given file path.
+// The schema is created on first use. WAL is enabled so concurrent
+// readers (history GETs) do not block the broadcast write path.
+func Open(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		return nil, fmt.Errorf("sqlite open %q: %w", path, err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := migrate(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+// DB exposes the underlying *sql.DB for tests that want to exercise
+// migrate() directly. Production callers should use the public methods.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// Migrate re-runs the schema migration. Useful in tests to confirm
+// idempotency; production callers do not need to invoke this — Open()
+// already migrates on first use.
+func (s *Store) Migrate() error { return migrate(s.db) }
+
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+func (s *Store) Append(ctx context.Context, msg models.ChatMessage) error {
+	metadata, err := json.Marshal(orEmptyMap(msg.Metadata))
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+        INSERT INTO messages (
+            id, room_id, type, sender_id, sender_kind, target_id,
+            content, reply_requested, turn_budget, created_at, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+		msg.ID,
+		msg.RoomID,
+		string(msg.Type),
+		msg.SenderID,
+		string(msg.SenderKind),
+		msg.TargetID,
+		msg.Content,
+		boolToInt(msg.ReplyRequested),
+		msg.TurnBudget,
+		msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+		string(metadata),
+	); err != nil {
+		return fmt.Errorf("sqlite append: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) List(ctx context.Context, roomID string, limit int) ([]models.ChatMessage, error) {
+	query := `
+        SELECT id, room_id, type, sender_id, sender_kind, target_id,
+               content, reply_requested, turn_budget, created_at, metadata_json
+        FROM messages
+        WHERE room_id = ?
+        ORDER BY seq DESC
+    `
+	args := []any{roomID}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.ChatMessage, 0)
+	for rows.Next() {
+		msg, err := scanMessageRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite rows: %w", err)
+	}
+
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func orEmptyMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
+}

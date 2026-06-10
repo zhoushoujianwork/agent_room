@@ -1,0 +1,9 @@
+/* Agent Room — entry stylesheet. Aggregates theme tokens + layout + chat + features. */
+@import "./theme.css";
+@import "./layout.css";
+@import "./chat.css";
+@import "./features.css";
+
+/* App-specific overrides */
+a { color: inherit; }
+button { font-family: inherit; }

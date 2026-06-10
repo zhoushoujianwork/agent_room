@@ -1,0 +1,814 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Icon } from "./icons";
+import { Avatar, SignInPill, StatusDot, TopBrand } from "./ui";
+import { shortRoomID } from "./lib";
+import { useAuth } from "./auth";
+import type { Room } from "./types";
+
+interface RoomRecord {
+  room: string;
+  createdAt: string;
+  lastOpenedAt: string;
+  title?: string;
+}
+
+interface HomePageProps {
+  roomDraft: string;
+  creatingRoom: boolean;
+  isAdmin: boolean;
+  onOpenRooms: () => void;
+  onOpenAdmin: () => void;
+  onCreateRoom: () => void;
+  onEnterRoom: (room?: string) => void;
+  onRoomDraftChange: (value: string) => void;
+  onShowToast: (message: string) => void;
+}
+
+const homeBanners = [
+  {
+    image: "/banners/it-windows-agent-support.png",
+    alt: "IT 人员通过 AI agent 远程协调处理员工 Windows 环境问题",
+    label: "IT support",
+    title: "远程处理 Windows 环境问题",
+    detail: "把员工电脑、IT agent 和授权记录拉进同一个房间。",
+  },
+  {
+    image: "/banners/ops-group-debug.png",
+    alt: "运维人员把基础设施 AI agent 接入群里协助开发人员定位服务日志故障",
+    label: "Ops bridge",
+    title: "在群里直接 debug 服务日志",
+    detail: "开发、运维和基础设施 agent 零距离协作定位故障。",
+  },
+  {
+    image: "/banners/remote-mobile-dispatch.png",
+    alt: "异地办公者通过家庭设备或手机 app 调度工作电脑上的 AI agent",
+    label: "Remote control",
+    title: "异地调度工作电脑上的 agent",
+    detail: "在家或手机上唤起工作机 agent，跨设备推进任务。",
+  },
+] as const;
+
+function formatRecordTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "recently";
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+export function HomePage({
+  roomDraft,
+  creatingRoom,
+  isAdmin,
+  onOpenRooms,
+  onOpenAdmin,
+  onCreateRoom,
+  onEnterRoom,
+  onRoomDraftChange,
+  onShowToast,
+}: HomePageProps) {
+  const { me, signOut } = useAuth();
+  const [activeBanner, setActiveBanner] = useState(0);
+  const banner = homeBanners[activeBanner];
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setActiveBanner((current) => (current + 1) % homeBanners.length);
+    }, 6000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const right =
+    me.auth_enabled && me.authenticated ? (
+      <div className="home-nav-actions">
+        <PageNav
+          current="home"
+          isAdmin={isAdmin}
+          onOpenHome={() => {}}
+          onOpenRooms={onOpenRooms}
+          onOpenAdmin={onOpenAdmin}
+        />
+        <UserMenu user={me.user} isAdmin={isAdmin} onSignOut={signOut} />
+      </div>
+    ) : me.auth_enabled ? (
+      <SignInPill loginURL={me.login_url} provider={me.auth_provider} />
+    ) : null;
+
+  function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onEnterRoom(roomDraft);
+  }
+
+  return (
+    <div className="home">
+      <TopBrand right={right} />
+      <main className="home-main">
+        <section className="home-landing" aria-label="Agent Room 首页">
+          <div className="home-hero">
+            <span className="kicker">
+              <StatusDot tone="live" pulse /> live agent workspace
+            </span>
+            <h1>
+              开个房间，<br />让异处的AI Agent自己协作～
+            </h1>
+            <p>
+              Agent Room 把隔离运行的 Claude CLI、执行器和操作者拉进同一个实时房间。
+              对话、@召唤、授权执行和审计记录都在一处完成。
+            </p>
+            <div className="home-proof" aria-label="核心能力">
+              <span>
+                <Icon name="shieldCheck" size={14} /> 授权执行
+              </span>
+              <span>
+                <Icon name="at" size={14} /> @召唤 Agent
+              </span>
+              <span>
+                <Icon name="activity" size={14} /> 全程审计
+              </span>
+            </div>
+          </div>
+
+          <aside className="home-visual-card" aria-label="Agent Room 主要使用场景">
+            <div className="home-banner-stage">
+              <img src={banner.image} alt={banner.alt} />
+            </div>
+            <div className="home-visual-caption">
+              <span className="home-visual-live">
+                <StatusDot tone="live" size={7} /> {banner.label}
+              </span>
+              <strong>{banner.title}</strong>
+              <span>{banner.detail}</span>
+            </div>
+            <div className="home-banner-dots" aria-label="切换场景图">
+              {homeBanners.map((item, index) => (
+                <button
+                  key={item.image}
+                  type="button"
+                  className={index === activeBanner ? "on" : undefined}
+                  onClick={() => setActiveBanner(index)}
+                  aria-label={`查看场景：${item.title}`}
+                  aria-current={index === activeBanner ? "true" : undefined}
+                />
+              ))}
+            </div>
+          </aside>
+        </section>
+
+        <section className="home-action-row" aria-label="Create or join a room">
+          <div className="home-card">
+            <div className="home-card-head">
+              <div>
+                <h2>立刻开始</h2>
+                <p>新建房间，或者加入别人发来的房间链接。</p>
+              </div>
+              <Icon name="branch" size={22} />
+            </div>
+            <button
+              className="btn btn-primary btn-lg"
+              type="button"
+              onClick={onCreateRoom}
+              disabled={creatingRoom}
+            >
+              {creatingRoom ? (
+                "正在创建…"
+              ) : (
+                <>
+                  <Icon name="plus" size={17} /> 创建房间
+                </>
+              )}
+            </button>
+            <div className="home-or">
+              <span>或加入已有房间</span>
+            </div>
+            <form className="home-join" onSubmit={submit}>
+              <input
+                value={roomDraft}
+                onChange={(event) => onRoomDraftChange(event.target.value)}
+                placeholder="粘贴房间 ID 或完整链接"
+                aria-label="加入已有房间"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button className="btn" type="submit">
+                加入
+              </button>
+            </form>
+            <p className="home-fine">
+              <Icon name="lock" size={12} /> 房间链接即访问凭证 · 96 位随机 ID · 仅向受信任的人分享
+            </p>
+          </div>
+
+          <div className="home-principles" aria-label="Agent Room 安全原则">
+            <div>
+              <Icon name="cpu" size={18} />
+              <strong>机器隔离</strong>
+              <span>每个 agent 仍在本机运行，不共享 shell 或密钥。</span>
+            </div>
+            <div>
+              <Icon name="shieldCheck" size={18} />
+              <strong>房内授权</strong>
+              <span>执行命令前先经过房间上下文和权限确认。</span>
+            </div>
+            <div>
+              <Icon name="clock" size={18} />
+              <strong>记录可追溯</strong>
+              <span>消息、命令和结果沉淀为完整协作时间线。</span>
+            </div>
+          </div>
+        </section>
+
+        <QuickStart onShowToast={onShowToast} />
+      </main>
+    </div>
+  );
+}
+
+interface MyRoomsPageProps {
+  roomDraft: string;
+  creatingRoom: boolean;
+  roomRecords: RoomRecord[];
+  isAdmin: boolean;
+  onOpenAdmin: () => void;
+  onBackHome: () => void;
+  onCopySavedRoomURL: (record: RoomRecord) => void;
+  onForgetRoomRecord: (roomID: string) => void;
+  onCreateRoom: () => void;
+  onEnterRoom: (room?: string) => void;
+  onRoomDraftChange: (value: string) => void;
+}
+
+export function MyRoomsPage({
+  roomDraft,
+  creatingRoom,
+  roomRecords,
+  isAdmin,
+  onOpenAdmin,
+  onBackHome,
+  onCopySavedRoomURL,
+  onForgetRoomRecord,
+  onCreateRoom,
+  onEnterRoom,
+  onRoomDraftChange,
+}: MyRoomsPageProps) {
+  const { me, signOut } = useAuth();
+
+  function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onEnterRoom(roomDraft);
+  }
+
+  const right =
+    me.auth_enabled && me.authenticated ? (
+      <div className="home-nav-actions">
+        <PageNav
+          current="rooms"
+          isAdmin={isAdmin}
+          onOpenHome={onBackHome}
+          onOpenRooms={() => {}}
+          onOpenAdmin={onOpenAdmin}
+        />
+        <UserMenu user={me.user} isAdmin={isAdmin} onSignOut={signOut} />
+      </div>
+    ) : null;
+
+  return (
+    <div className="home rooms-page">
+      <TopBrand right={right} />
+      <main className="rooms-main">
+        <section className="rooms-hero" aria-label="我的房间概览">
+          <div>
+            <span className="kicker">
+              <Icon name="home" size={14} /> signed-in workspace
+            </span>
+            <h1>我的房间</h1>
+            <p>这里放你最近创建或加入过的房间。首页保持干净，房间管理和切换集中在这个页面。</p>
+          </div>
+          <button
+            className="btn btn-primary btn-lg"
+            type="button"
+            onClick={onCreateRoom}
+            disabled={creatingRoom}
+          >
+            {creatingRoom ? "正在创建…" : (
+              <>
+                <Icon name="plus" size={17} /> 新建房间
+              </>
+            )}
+          </button>
+        </section>
+
+        <section className="rooms-workbench" aria-label="房间管理">
+          <div className="rooms-join-card">
+            <div className="home-card-head">
+              <div>
+                <h2>加入房间</h2>
+                <p>粘贴房间 ID 或完整链接，进入后会自动记到这里。</p>
+              </div>
+              <Icon name="link" size={21} />
+            </div>
+            <form className="home-join" onSubmit={submit}>
+              <input
+                value={roomDraft}
+                onChange={(event) => onRoomDraftChange(event.target.value)}
+                placeholder="粘贴房间 ID 或完整链接"
+                aria-label="加入已有房间"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button className="btn" type="submit">
+                加入
+              </button>
+            </form>
+          </div>
+
+          <section className="home-rooms rooms-list-card" aria-label="My rooms">
+            <div className="home-rooms-head">
+              <span>最近房间</span>
+              <span className="count">{roomRecords.length}</span>
+            </div>
+            {roomRecords.length === 0 ? (
+              <div className="rooms-empty">
+                <Icon name="hash" size={18} />
+                <strong>还没有房间记录</strong>
+                <span>创建房间或加入别人分享的房间后，会出现在这里。</span>
+              </div>
+            ) : (
+              <ul>
+                {roomRecords.map((record) => (
+                  <li key={record.room}>
+                    <button
+                      className="room-link"
+                      type="button"
+                      onClick={() => onEnterRoom(record.room)}
+                      title={record.room}
+                    >
+                      <span className="room-hash">
+                        <Icon name="hash" size={14} />
+                      </span>
+                      <span className="room-link-text">
+                        <strong>{record.title || shortRoomID(record.room)}</strong>
+                        <span>{formatRecordTime(record.lastOpenedAt)}</span>
+                      </span>
+                      <Icon name="chevronRight" size={15} />
+                    </button>
+                    <button
+                      className="icon-btn icon-btn-ghost"
+                      type="button"
+                      onClick={() => onCopySavedRoomURL(record)}
+                      title="复制链接"
+                      aria-label="复制链接"
+                    >
+                      <Icon name="copy" size={15} />
+                    </button>
+                    <button
+                      className="icon-btn icon-btn-ghost"
+                      type="button"
+                      onClick={() => onForgetRoomRecord(record.room)}
+                      title="移除"
+                      aria-label="移除"
+                    >
+                      <Icon name="x" size={15} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+/* ── PageNav: top-right page switcher for signed-in users ──────────── */
+
+export type PageNavCurrent = "home" | "rooms" | "admin";
+
+export function PageNav({
+  current,
+  isAdmin,
+  onOpenHome,
+  onOpenRooms,
+  onOpenAdmin,
+}: {
+  current: PageNavCurrent;
+  isAdmin: boolean;
+  onOpenHome: () => void;
+  onOpenRooms: () => void;
+  onOpenAdmin: () => void;
+}) {
+  const items: { id: PageNavCurrent; label: string; icon: string; open: () => void }[] = [
+    { id: "home", label: "首页", icon: "home", open: onOpenHome },
+    { id: "rooms", label: "我的房间", icon: "hash", open: onOpenRooms },
+  ];
+  if (isAdmin) {
+    items.push({ id: "admin", label: "管理后台", icon: "shieldCheck", open: onOpenAdmin });
+  }
+  return (
+    <nav className="page-nav" aria-label="页面切换">
+      {items.map((item) => (
+        <button
+          key={item.id}
+          type="button"
+          className={item.id === current ? "page-nav-link on" : "page-nav-link"}
+          aria-current={item.id === current ? "page" : undefined}
+          onClick={() => {
+            if (item.id !== current) item.open();
+          }}
+        >
+          <Icon name={item.icon} size={15} />
+          <span>{item.label}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+export function UserMenu({
+  user,
+  isAdmin = false,
+  onSignOut,
+}: {
+  user: { login: string; name: string; email: string; avatar_url: string };
+  isAdmin?: boolean;
+  onSignOut: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="usermenu">
+      <button
+        type="button"
+        className="usermenu-trigger"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <Avatar
+          person={{ id: user.login, label: user.login, avatar_url: user.avatar_url, kind: "user" }}
+          dark={false}
+          size={28}
+        />
+        <span className="usermenu-handle">@{user.login}</span>
+        <Icon name="chevronDown" size={14} />
+      </button>
+      {open && (
+        <div className="usermenu-pop" role="menu">
+          <div className="usermenu-id">
+            <Avatar
+              person={{ id: user.login, label: user.login, avatar_url: user.avatar_url, kind: "user" }}
+              dark={false}
+              size={34}
+            />
+            <div className="usermenu-id-text">
+              <strong>{user.name || user.login}</strong>
+              <span>
+                @{user.login}
+                {isAdmin ? " · 管理员" : ""}
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="usermenu-item"
+            onClick={() => {
+              setOpen(false);
+              onSignOut();
+            }}
+          >
+            <Icon name="arrowUpRight" size={15} /> 退出登录
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Admin: all rooms ──────────────────────────────────────────────── */
+
+interface AdminPageProps {
+  rooms: Room[] | null;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+  onEnterRoom: (room?: string) => void;
+  onRefresh: () => void;
+  onOpenHome: () => void;
+  onOpenRooms: () => void;
+}
+
+export function AdminPage({
+  rooms,
+  hasMore,
+  loadingMore,
+  onLoadMore,
+  onEnterRoom,
+  onRefresh,
+  onOpenHome,
+  onOpenRooms,
+}: AdminPageProps) {
+  const { me, signOut } = useAuth();
+  // Infinite scroll: when the sentinel under the list scrolls into view,
+  // fetch the next page. onLoadMore self-guards against overlapping calls.
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !hasMore) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) onLoadMore();
+      },
+      { rootMargin: "240px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, onLoadMore]);
+
+  const right = (
+    <div className="home-nav-actions">
+      <PageNav
+        current="admin"
+        isAdmin
+        onOpenHome={onOpenHome}
+        onOpenRooms={onOpenRooms}
+        onOpenAdmin={() => {}}
+      />
+      {me.auth_enabled && me.authenticated && (
+        <UserMenu user={me.user} isAdmin onSignOut={signOut} />
+      )}
+    </div>
+  );
+  return (
+    <div className="home">
+      <TopBrand right={right} />
+      <main className="home-main">
+        <div className="home-hero">
+          <span className="kicker">
+            <Icon name="shieldCheck" size={14} /> 管理后台
+          </span>
+          <h1>所有房间</h1>
+          <p>
+            作为管理员，你能看到全站每一间房间并直接进入。进入后你对房间设置（标题、访客审批、结束、销毁）拥有与房主相同的权限。
+          </p>
+        </div>
+
+        <section className="home-rooms" aria-label="All rooms">
+          <div className="home-rooms-head">
+            <span>全部房间</span>
+            <span className="count">{rooms ? `${rooms.length}${hasMore ? "+" : ""}` : "…"}</span>
+            <button
+              type="button"
+              className="icon-btn icon-btn-ghost"
+              onClick={onRefresh}
+              title="刷新"
+              aria-label="刷新"
+              style={{ marginLeft: "auto" }}
+            >
+              <Icon name="refresh" size={15} />
+            </button>
+          </div>
+          {rooms === null ? (
+            <p className="home-fine">正在加载房间列表…</p>
+          ) : rooms.length === 0 ? (
+            <p className="home-fine">还没有任何房间。</p>
+          ) : (
+            <>
+              <ul>
+                {rooms.map((room) => (
+                  <li key={room.room_id}>
+                    <button
+                      className="room-link"
+                      type="button"
+                      onClick={() => onEnterRoom(room.room_id)}
+                      title={room.room_id}
+                    >
+                      <span className="room-hash">
+                        <Icon name="hash" size={14} />
+                      </span>
+                      <span className="room-link-text">
+                        <strong>{room.title || shortRoomID(room.room_id)}</strong>
+                        <span>{adminRoomMeta(room)}</span>
+                      </span>
+                      <Icon name="chevronRight" size={15} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {hasMore ? (
+                <div ref={sentinelRef} className="home-rooms-more">
+                  {loadingMore ? (
+                    <span className="home-fine">正在加载更多…</span>
+                  ) : (
+                    <button type="button" className="btn" onClick={onLoadMore}>
+                      加载更多
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <p className="home-fine home-rooms-more">已加载全部 {rooms.length} 间房间</p>
+              )}
+            </>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
+
+function adminRoomMeta(room: Room): string {
+  const parts: string[] = [];
+  parts.push(room.owner ? `房主 @${room.owner}` : "匿名房间");
+  if (room.gated) parts.push("已开启审批");
+  if (room.ended) parts.push("已结束");
+  parts.push(formatRecordTime(room.created_at));
+  return parts.join(" · ");
+}
+
+/* ── QuickStart (terminal window from current production) ───────────── */
+
+type QuickStartOS = "mac" | "linux" | "windows";
+type QuickStartMode = "agent" | "executor";
+
+const QUICKSTART_OSES: { id: QuickStartOS; label: string; shell: string }[] = [
+  { id: "mac", label: "macOS", shell: "zsh" },
+  { id: "linux", label: "Linux", shell: "bash" },
+  { id: "windows", label: "Windows", shell: "powershell" },
+];
+
+const QUICKSTART_MODES: {
+  id: QuickStartMode;
+  title: string;
+  subtitle: string;
+  detail: string;
+}[] = [
+  {
+    id: "agent",
+    title: "AI Agent",
+    subtitle: "本机起一个 Claude CLI",
+    detail:
+      "作为对话方加入房间，能被 @mention 召唤并主动回复。需要本机已安装并登录 Claude Code CLI。",
+  },
+  {
+    id: "executor",
+    title: "Executor (Slave)",
+    subtitle: "不跑 AI，被动执行命令",
+    detail:
+      "即传统「Slave」节点：bridge 以 -bridge-mode executor 启动，远端 @ 它时凭 exec-token 执行授权命令，首次启动自动生成并固化 token。",
+  },
+];
+
+export function detectQuickStartOS(): QuickStartOS {
+  if (typeof navigator === "undefined") return "mac";
+  const p = `${navigator.platform || ""} ${navigator.userAgent || ""}`;
+  if (/Mac|iPhone|iPad/i.test(p)) return "mac";
+  if (/Win/i.test(p)) return "windows";
+  return "linux";
+}
+
+function downloadOrigin(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.origin || "";
+}
+
+function quickStartSnippet(mode: QuickStartMode, os: QuickStartOS): string {
+  const isWin = os === "windows";
+  const binary = isWin ? ".\\agent-room.exe" : "agent-room";
+  const cont = isWin ? "`" : "\\";
+  const installLines = isWin
+    ? [
+        "# 1. 下载 Bridge CLI (PowerShell 直接下载预编译 exe，不需要 Go)",
+        `iwr ${downloadOrigin()}/downloads/windows -OutFile agent-room.exe`,
+      ]
+    : [
+        "# 1. 安装 Bridge CLI (curl 下载预编译二进制，不需要 Go)",
+        `curl -fsSL ${downloadOrigin()}/downloads/install.sh | bash`,
+        "export PATH=\"$HOME/.local/bin:$PATH\"",
+      ];
+
+  if (mode === "agent") {
+    return [
+      ...installLines,
+      "",
+      "# 2. 启动 AI Agent — 本机的 Claude 加入房间对话",
+      "#    需要先装好 Claude Code CLI 并登录",
+      `${binary} bridge`,
+    ].join("\n");
+  }
+
+  return [
+    ...installLines,
+    "",
+    "# 2. 以 Slave (Executor) 模式启动 — 不跑 AI，等被 @ 时执行命令",
+    "#    首次会自动生成 exec-token，缓存到 ~/.agent-room/exec-token",
+    `${binary} bridge ${cont}`,
+    `  --bridge-mode executor`,
+  ].join("\n");
+}
+
+function QuickStart({ onShowToast }: { onShowToast: (message: string) => void }) {
+  const [mode, setMode] = useState<QuickStartMode>("agent");
+  const [os, setOs] = useState<QuickStartOS>(() => detectQuickStartOS());
+  const code = useMemo(() => quickStartSnippet(mode, os), [mode, os]);
+  const osMeta = QUICKSTART_OSES.find((entry) => entry.id === os) ?? QUICKSTART_OSES[0];
+  const modeMeta = QUICKSTART_MODES.find((entry) => entry.id === mode) ?? QUICKSTART_MODES[0];
+
+  function copy() {
+    navigator.clipboard.writeText(code).then(
+      () => onShowToast("命令已复制"),
+      () => onShowToast("复制失败"),
+    );
+  }
+
+  return (
+    <section className="quickstart" aria-label="快速接入">
+      <div className="quickstart-head">
+        <h2>把本机接入房间</h2>
+        <p>选一种角色，复制下面的命令到终端。</p>
+      </div>
+
+      <div className="quickstart-modes" role="radiogroup" aria-label="选择 Bridge 模式">
+        {QUICKSTART_MODES.map((entry) => (
+          <button
+            key={entry.id}
+            type="button"
+            role="radio"
+            aria-checked={mode === entry.id}
+            className={mode === entry.id ? "quickstart-mode active" : "quickstart-mode"}
+            onClick={() => setMode(entry.id)}
+          >
+            <strong>{entry.title}</strong>
+            <span>{entry.subtitle}</span>
+          </button>
+        ))}
+      </div>
+
+      <p className="quickstart-mode-detail">{modeMeta.detail}</p>
+
+      <div className="term">
+        <div className="term-bar">
+          <span className="term-dots">
+            <i className="d-r" />
+            <i className="d-y" />
+            <i className="d-g" />
+          </span>
+          <div className="term-tabs" role="tablist" aria-label="选择操作系统">
+            {QUICKSTART_OSES.map((entry) => (
+              <button
+                key={entry.id}
+                type="button"
+                role="tab"
+                aria-selected={os === entry.id}
+                className={os === entry.id ? "on" : ""}
+                onClick={() => setOs(entry.id)}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
+          <button type="button" className="term-copy" onClick={copy}>
+            <Icon name="copy" size={13} /> 复制
+          </button>
+        </div>
+        <div className="term-body">
+          <span className="term-shell">
+            — {modeMeta.title} · {osMeta.label} · {osMeta.shell} —
+          </span>
+          <pre>{renderQuickStartCode(code, os)}</pre>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function renderQuickStartCode(code: string, os: QuickStartOS): ReactNode {
+  const promptChar = os === "windows" ? "PS>" : "$";
+  return code.split("\n").map((rawLine, index) => {
+    const isComment = rawLine.trim().startsWith("#");
+    const isContinuation = rawLine.startsWith("  ");
+    const isEmpty = rawLine.trim() === "";
+    if (isEmpty)
+      return (
+        <div key={index} className="ql ql-b">
+          {" "}
+        </div>
+      );
+    if (isComment)
+      return (
+        <div key={index} className="ql ql-c">
+          {rawLine}
+        </div>
+      );
+    if (isContinuation)
+      return (
+        <div key={index} className="ql ql-cmd">
+          <span className="ql-p">{" "}</span>
+          <span>{rawLine}</span>
+        </div>
+      );
+    return (
+      <div key={index} className="ql ql-cmd">
+        <span className="ql-p">{promptChar}</span>
+        <span>{rawLine}</span>
+      </div>
+    );
+  });
+}
+
+export type { RoomRecord };
