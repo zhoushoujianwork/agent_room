@@ -190,7 +190,7 @@ func (s *Server) handleSSOLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	returnTo := safeReturnPath(r.URL.Query().Get("state"))
-	redirectURI := deriveHTTPBaseURL(r) + "/auth/sso/callback"
+	redirectURI := s.publicBaseURL(r) + "/auth/sso/callback"
 	authorize, err := url.Parse(s.cfg.BuildHub.AuthorizeURL)
 	if err != nil {
 		writeAuthError(w, http.StatusInternalServerError, "bad authorize url")
@@ -389,7 +389,7 @@ func (s *Server) cookieName() string {
 func (s *Server) oauthConfig(r *http.Request) *oauth2.Config {
 	redirect := strings.TrimSpace(s.cfg.GitHub.RedirectURI)
 	if redirect == "" {
-		redirect = deriveHTTPBaseURL(r) + "/auth/github/callback"
+		redirect = s.publicBaseURL(r) + "/auth/github/callback"
 	}
 	return &oauth2.Config{
 		ClientID:     s.cfg.GitHub.ClientID,

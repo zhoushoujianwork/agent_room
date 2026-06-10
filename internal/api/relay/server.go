@@ -117,7 +117,7 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := deriveHTTPBaseURL(r)
+	baseURL := s.publicBaseURL(r)
 	script := unixInstallScript(baseURL)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -1068,7 +1068,6 @@ func newRoomID() string {
 	return hex.EncodeToString(b[:])
 }
 
-
 func deriveHTTPBaseURL(r *http.Request) string {
 	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
 	scheme := "http"
@@ -1080,6 +1079,13 @@ func deriveHTTPBaseURL(r *http.Request) string {
 		host = forwardedHost
 	}
 	return fmt.Sprintf("%s://%s", scheme, host)
+}
+
+func (s *Server) publicBaseURL(r *http.Request) string {
+	if base := strings.TrimRight(strings.TrimSpace(s.cfg.PublicBaseURL), "/"); base != "" {
+		return base
+	}
+	return deriveHTTPBaseURL(r)
 }
 
 func normalizeDownloadArch(arch string) string {

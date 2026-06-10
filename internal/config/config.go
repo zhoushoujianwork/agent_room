@@ -8,16 +8,17 @@ import (
 )
 
 type Config struct {
-	Addr         string
-	DBPath       string
-	RelayURL     string
-	RoomID       string
-	BridgeMode   string
-	AgentID      string
-	AgentLabel   string
-	Capabilities string
-	Provider     string
-	SystemPrompt string
+	Addr          string
+	DBPath        string
+	RelayURL      string
+	PublicBaseURL string
+	RoomID        string
+	BridgeMode    string
+	AgentID       string
+	AgentLabel    string
+	Capabilities  string
+	Provider      string
+	SystemPrompt  string
 	// ContextFile is an optional path to a local file (e.g. an incident
 	// handoff note) whose contents are injected into the agent prompt at
 	// startup as trusted operator-provided background. Agent mode only;
@@ -155,6 +156,7 @@ func Load() Config {
 		Addr:          envString("AGENT_ROOM_ADDR", ":8080"),
 		DBPath:        envString("AGENT_ROOM_DB_PATH", ""),
 		RelayURL:      envString("AGENT_ROOM_RELAY_URL", ""),
+		PublicBaseURL: envString("AGENT_ROOM_PUBLIC_BASE_URL", ""),
 		RoomID:        envString("AGENT_ROOM_ROOM_ID", ""),
 		BridgeMode:    envString("AGENT_ROOM_BRIDGE_MODE", "agent"),
 		AgentID:       envString("AGENT_ROOM_AGENT_ID", ""),
