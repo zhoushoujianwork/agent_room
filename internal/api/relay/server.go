@@ -179,6 +179,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" &&
 		r.URL.Path != "/agent-room-intro.svg" &&
 		r.URL.Path != "/rooms" &&
+		r.URL.Path != "/agents" &&
 		r.URL.Path != "/admin" &&
 		!strings.HasPrefix(r.URL.Path, "/rooms/") &&
 		!strings.HasPrefix(r.URL.Path, "/assets/") &&

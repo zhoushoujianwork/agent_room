@@ -17,6 +17,7 @@ interface HomePageProps {
   creatingRoom: boolean;
   isAdmin: boolean;
   onOpenRooms: () => void;
+  onOpenAgents: () => void;
   onOpenAdmin: () => void;
   onCreateRoom: () => void;
   onEnterRoom: (room?: string, audit?: boolean) => void;
@@ -59,6 +60,7 @@ export function HomePage({
   creatingRoom,
   isAdmin,
   onOpenRooms,
+  onOpenAgents,
   onOpenAdmin,
   onCreateRoom,
   onEnterRoom,
@@ -84,6 +86,7 @@ export function HomePage({
           isAdmin={isAdmin}
           onOpenHome={() => {}}
           onOpenRooms={onOpenRooms}
+          onOpenAgents={onOpenAgents}
           onOpenAdmin={onOpenAdmin}
         />
         <UserMenu user={me.user} isAdmin={isAdmin} onSignOut={signOut} />
@@ -226,6 +229,7 @@ interface MyRoomsPageProps {
   creatingRoom: boolean;
   roomRecords: RoomRecord[];
   isAdmin: boolean;
+  onOpenAgents: () => void;
   onOpenAdmin: () => void;
   onBackHome: () => void;
   onCopySavedRoomURL: (record: RoomRecord) => void;
@@ -240,6 +244,7 @@ export function MyRoomsPage({
   creatingRoom,
   roomRecords,
   isAdmin,
+  onOpenAgents,
   onOpenAdmin,
   onBackHome,
   onCopySavedRoomURL,
@@ -263,6 +268,7 @@ export function MyRoomsPage({
           isAdmin={isAdmin}
           onOpenHome={onBackHome}
           onOpenRooms={() => {}}
+          onOpenAgents={onOpenAgents}
           onOpenAdmin={onOpenAdmin}
         />
         <UserMenu user={me.user} isAdmin={isAdmin} onSignOut={signOut} />
@@ -380,24 +386,27 @@ export function MyRoomsPage({
 
 /* ── PageNav: top-right page switcher for signed-in users ──────────── */
 
-export type PageNavCurrent = "home" | "rooms" | "admin";
+export type PageNavCurrent = "home" | "rooms" | "agents" | "admin";
 
 export function PageNav({
   current,
   isAdmin,
   onOpenHome,
   onOpenRooms,
+  onOpenAgents,
   onOpenAdmin,
 }: {
   current: PageNavCurrent;
   isAdmin: boolean;
   onOpenHome: () => void;
   onOpenRooms: () => void;
+  onOpenAgents: () => void;
   onOpenAdmin: () => void;
 }) {
   const items: { id: PageNavCurrent; label: string; icon: string; open: () => void }[] = [
     { id: "home", label: "首页", icon: "home", open: onOpenHome },
     { id: "rooms", label: "我的房间", icon: "hash", open: onOpenRooms },
+    { id: "agents", label: "我的 Agents", icon: "bot", open: onOpenAgents },
   ];
   if (isAdmin) {
     items.push({ id: "admin", label: "管理后台", icon: "shieldCheck", open: onOpenAdmin });
@@ -494,6 +503,7 @@ interface AdminPageProps {
   onRefreshUsers: () => void;
   onOpenHome: () => void;
   onOpenRooms: () => void;
+  onOpenAgents: () => void;
 }
 
 export function AdminPage({
@@ -507,6 +517,7 @@ export function AdminPage({
   onRefreshUsers,
   onOpenHome,
   onOpenRooms,
+  onOpenAgents,
 }: AdminPageProps) {
   const { me, signOut } = useAuth();
   const [panel, setPanel] = useState<"rooms" | "users">("users");
@@ -533,6 +544,7 @@ export function AdminPage({
         isAdmin
         onOpenHome={onOpenHome}
         onOpenRooms={onOpenRooms}
+        onOpenAgents={onOpenAgents}
         onOpenAdmin={() => {}}
       />
       {me.auth_enabled && me.authenticated && (

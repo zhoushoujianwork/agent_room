@@ -45,6 +45,7 @@ import {
 } from "./api";
 import { AuthProvider, isAdmin as isAdminMe, isOwnerOf, ThemeProvider, useAuth, useTheme } from "./auth";
 import { AdminPage, HomePage, MyRoomsPage, type RoomRecord } from "./home";
+import { AgentsPage } from "./agents";
 import {
   Composer,
   ConfirmModal,
@@ -80,7 +81,7 @@ import {
 import { collectExecutorSessions, ExecutorTermPanel } from "./terminal";
 import { Icon } from "./icons";
 
-type AppView = "home" | "room" | "rooms" | "admin";
+type AppView = "home" | "room" | "rooms" | "agents" | "admin";
 
 const ROOM_TABS: RoomTab[] = ["chat", "activity", "approvals", "summary", "agents", "settings"];
 
@@ -97,6 +98,7 @@ function tabFromLocation(): RoomTab {
 function staticViewFromLocation(): AppView {
   const path = window.location.pathname.replace(/\/+$/, "");
   if (path === "/rooms") return "rooms";
+  if (path === "/agents") return "agents";
   if (path === "/admin") return "admin";
   return "home";
 }
@@ -454,6 +456,16 @@ function InnerApp() {
     }
     return false;
   }
+
+  // Direct deep-link to /agents while signed out: send the visitor to the
+  // login flow with a return-to so they land back on the page (acceptance #5).
+  // Runs before the generic bounce-home guard below so the URL is preserved.
+  useEffect(() => {
+    if (authLoading || hasSignedIdentity || appView !== "agents") return;
+    if (me.auth_enabled) {
+      window.location.href = loginURLForReturn(me.login_url, "/agents");
+    }
+  }, [appView, authLoading, hasSignedIdentity, me]);
 
   useEffect(() => {
     if (authLoading || hasSignedIdentity || appView === "home") return;
@@ -1210,6 +1222,17 @@ function InnerApp() {
     window.history.pushState(null, "", "/rooms");
   }
 
+  function openAgents() {
+    if (!requireSignedIdentity("/agents")) return;
+    setAppView("agents");
+    setAuditRoom(null);
+    setRoomID("");
+    setMessages([]);
+    setParticipants([]);
+    setRoom(null);
+    window.history.pushState(null, "", "/agents");
+  }
+
   const refreshAdminRooms = useCallback(() => {
     listAllRooms(0, ADMIN_ROOMS_PAGE).then((page) => {
       setAdminRooms(page);
@@ -1414,6 +1437,23 @@ function InnerApp() {
           onRefreshUsers={refreshAdminUsers}
           onOpenHome={goHome}
           onOpenRooms={openRooms}
+          onOpenAgents={openAgents}
+        />
+        {toast && <div className="toast">{toast}</div>}
+      </>
+    );
+  }
+
+  if (appView === "agents") {
+    return (
+      <>
+        <AgentsPage
+          isAdmin={admin}
+          onOpenHome={goHome}
+          onOpenRooms={openRooms}
+          onOpenAdmin={openAdmin}
+          onEnterRoom={enterRoom}
+          onShowToast={showToast}
         />
         {toast && <div className="toast">{toast}</div>}
       </>
@@ -1428,6 +1468,7 @@ function InnerApp() {
           creatingRoom={creatingRoom}
           isAdmin={admin}
           onOpenRooms={openRooms}
+          onOpenAgents={openAgents}
           onOpenAdmin={openAdmin}
           onEnterRoom={enterRoom}
           onCreateRoom={createAndEnterRoom}
@@ -1448,6 +1489,7 @@ function InnerApp() {
           creatingRoom={creatingRoom}
           roomRecords={roomRecords}
           isAdmin={admin}
+          onOpenAgents={openAgents}
           onOpenAdmin={openAdmin}
           onBackHome={goHome}
           onCopySavedRoomURL={copySavedRoomURL}

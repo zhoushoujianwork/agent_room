@@ -571,3 +571,111 @@
   border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink);
   cursor: pointer; font-size: 13px; font-weight: 600; text-decoration: none; }
 .signin-pill:hover { border-color: var(--accent-line); color: var(--accent-bright); }
+
+/* ── Agents 管理页（/agents）─────────────────────────────────────── */
+.btn-sm { height: 30px; padding: 0 11px; font-size: 12.5px; gap: 5px; }
+
+.agent-mgr-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.agent-mgr-row {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px;
+  padding: 13px 15px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--surface);
+}
+.agent-mgr-main { display: flex; align-items: flex-start; gap: 11px; flex: 1 1 260px; min-width: 0; }
+.agent-mgr-status { display: inline-grid; place-items: center; padding-top: 4px; }
+.agent-mgr-text { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.agent-mgr-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.agent-mgr-title strong { font-size: 14.5px; color: var(--ink); word-break: break-all; }
+.agent-mgr-provider {
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  padding: 1px 7px; border-radius: 999px; background: var(--surface-3);
+}
+.agent-mgr-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.agent-mgr-id {
+  display: inline-flex; align-items: center; gap: 4px; border: 0; cursor: pointer;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--muted);
+  background: var(--surface-3); padding: 2px 8px; border-radius: var(--r-sm);
+}
+.agent-mgr-id:hover { color: var(--accent-bright); }
+.agent-mgr-rooms { display: flex; flex-wrap: wrap; gap: 6px; }
+.agent-mgr-room {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+  font-size: 11.5px; font-weight: 600; color: var(--accent-bright);
+  border: 1px solid var(--accent-line); background: var(--accent-faint);
+  padding: 2px 8px; border-radius: 999px;
+}
+.agent-mgr-room:hover { background: var(--accent-soft); }
+.agent-mgr-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-left: auto; }
+.agent-mgr-confirm { display: inline-flex; align-items: center; gap: 6px; }
+.agent-mgr-config { flex-basis: 100%; margin-top: 4px; }
+
+.agent-config-soon {
+  border: 1px dashed var(--line); border-radius: var(--r-md);
+  background: var(--surface-2); padding: 13px 15px;
+}
+.agent-config-soon-head { display: flex; align-items: center; gap: 8px; color: var(--ink); }
+.agent-config-soon-head strong { font-size: 13.5px; }
+.agent-config-fields { display: grid; gap: 10px; margin-top: 10px; opacity: 0.55; }
+.agent-config-fields label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.agent-config-fields input {
+  height: 34px; padding: 0 11px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--ink); font-size: 13px;
+}
+
+/* Token 区 */
+.token-create-card {
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--surface); padding: 16px 18px;
+}
+.token-create-form { display: flex; gap: 9px; margin-top: 12px; flex-wrap: wrap; }
+.token-create-form input {
+  flex: 1 1 240px; height: 38px; padding: 0 13px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--ink); font-size: 13.5px;
+}
+
+.token-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.token-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 15px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface);
+}
+.token-row-main { display: flex; flex-direction: column; gap: 5px; flex: 1 1 240px; min-width: 0; }
+.token-prefix {
+  font-family: var(--font-mono); font-size: 13px; color: var(--ink);
+  background: var(--surface-3); padding: 2px 8px; border-radius: var(--r-sm); align-self: flex-start;
+}
+.token-note { font-size: 13px; color: var(--ink); }
+.token-row-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); }
+.token-row-meta span { display: inline-flex; align-items: center; gap: 4px; }
+
+/* 一次性 token 弹层 */
+.token-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 300; display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.5); padding: 18px;
+}
+.token-dialog {
+  width: min(560px, 100%); max-height: 90vh; overflow: auto;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
+  box-shadow: var(--shadow); padding: 20px 22px;
+}
+.token-dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.token-dialog-head h3 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 17px; color: var(--ink); }
+.token-dialog-warn {
+  display: flex; align-items: center; gap: 7px; margin: 12px 0 16px;
+  font-size: 12.5px; color: var(--warn); background: var(--warn-soft);
+  padding: 9px 12px; border-radius: var(--r-sm);
+}
+.token-dialog-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; font-size: 12px; color: var(--muted); }
+.token-dialog-copy {
+  display: flex; align-items: center; gap: 9px;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); padding: 9px 11px;
+}
+.token-dialog-copy code {
+  flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12.5px;
+  color: var(--ink); word-break: break-all;
+}
+.token-dialog-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+
+@media (max-width: 640px) {
+  .agent-mgr-actions { margin-left: 0; width: 100%; }
+}

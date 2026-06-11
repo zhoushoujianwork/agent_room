@@ -2,8 +2,11 @@ import type {
   AccessPersistence,
   AccessRequest,
   AdminUsersReport,
+  Agent,
+  AgentToken,
   AttachmentUpload,
   ChatMessage,
+  CreatedAgentToken,
   Me,
   Participant,
   Room,
@@ -168,6 +171,48 @@ export async function loadSummary(roomID: string): Promise<RoomSummary | null> {
   } catch {
     return null;
   }
+}
+
+/* ── agents (用户维度自管理) ──────────────────────────────────────── */
+
+// listAgents 返回登录用户名下全部 agent（含离线，在线状态由服务端合并 hub
+// presence）。失败（未登录 / 端点缺失）时抛出，由调用方决定降级。
+export async function listAgents(): Promise<Agent[]> {
+  const data = await getJSON<{ agents: Agent[] | null }>("/v1/agents");
+  return data.agents ?? [];
+}
+
+// deleteAgent 解绑（吊销）一个 agent。成功后该 agent 重连降级为匿名。
+export async function deleteAgent(agentID: string): Promise<void> {
+  const res = await fetch(`/v1/agents/${encodeURIComponent(agentID)}`, {
+    method: "DELETE",
+    credentials: "same-origin",
+  });
+  if (!res.ok) throw new Error(`delete agent → ${res.status}`);
+}
+
+// listAgentTokens 返回登录用户的接入 token 列表（脱敏：仅哈希前缀与元信息）。
+export async function listAgentTokens(): Promise<AgentToken[]> {
+  const data = await getJSON<{ tokens: AgentToken[] | null }>("/v1/agents/tokens");
+  return data.tokens ?? [];
+}
+
+// createAgentToken 生成一个新的接入 token，明文只在返回体里出现一次。
+export async function createAgentToken(note?: string): Promise<CreatedAgentToken> {
+  return sendJSON<CreatedAgentToken>(
+    "/v1/agents/tokens",
+    "POST",
+    note ? { note } : {},
+  );
+}
+
+// revokeAgentToken 按哈希前缀吊销一个 token，吊销后用它启动的 bridge 被拒绝。
+export async function revokeAgentToken(hashPrefix: string): Promise<void> {
+  const res = await fetch(`/v1/agents/tokens/${encodeURIComponent(hashPrefix)}`, {
+    method: "DELETE",
+    credentials: "same-origin",
+  });
+  if (!res.ok) throw new Error(`revoke token → ${res.status}`);
 }
 
 /* ── access requests ─────────────────────────────────────────────── */
