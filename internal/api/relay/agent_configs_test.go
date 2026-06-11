@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"agent-room/internal/config"
 	"agent-room/internal/io/memory"
@@ -155,5 +156,43 @@ func TestAgentConfigAPIKeyRejectedWithoutSecret(t *testing.T) {
 	cfg, _ := s.agents.GetAgentConfig(ctx, "a1")
 	if cfg.Model != "m" || cfg.APIBaseURL != "https://x/v1" {
 		t.Fatalf("model/base not saved: %+v", cfg)
+	}
+}
+
+// TestAgentConfigOptimisticLock verifies fix③:
+// PUT with expect_updated_at matching the stored value succeeds; a stale
+// expect_updated_at returns 409 and the write is not applied.
+func TestAgentConfigOptimisticLock(t *testing.T) {
+	s := newConfigServer(t, agentTestSecret, "the-secret")
+	ctx := context.Background()
+	_ = s.agents.UpsertAgent(ctx, models.Agent{AgentID: "a1", OwnerLogin: "alice"})
+
+	// First write — no expect_updated_at needed (fresh record).
+	rr := putConfig(t, s, "alice", "a1", `{"model":"m1"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first put = %d; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp agentConfigResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode first put response: %v", err)
+	}
+	updatedAt := resp.UpdatedAt
+
+	// Second write with a correct expect_updated_at → 200.
+	body := `{"model":"m2","expect_updated_at":"` + updatedAt.UTC().Format(time.RFC3339Nano) + `"}`
+	rr = putConfig(t, s, "alice", "a1", body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("second put with correct ts = %d; body=%s", rr.Code, rr.Body.String())
+	}
+
+	// Third write with the now-stale first timestamp → 409, model stays "m2".
+	staleBody := `{"model":"m3","expect_updated_at":"` + updatedAt.UTC().Format(time.RFC3339Nano) + `"}`
+	rr = putConfig(t, s, "alice", "a1", staleBody)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("stale put = %d, want 409; body=%s", rr.Code, rr.Body.String())
+	}
+	cfg, _ := s.agents.GetAgentConfig(ctx, "a1")
+	if cfg.Model != "m2" {
+		t.Fatalf("stale write was applied: model = %q, want m2", cfg.Model)
 	}
 }
