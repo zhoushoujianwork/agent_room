@@ -1,0 +1,538 @@
+import { useCallback, useEffect, useState } from "react";
+import { Icon } from "./icons";
+import { StatusDot, TopBrand } from "./ui";
+import { PageNav, UserMenu } from "./home";
+import { useAuth } from "./auth";
+import { copyText, relativeAge, shortRoomID } from "./lib";
+import {
+  createAgentToken,
+  deleteAgent,
+  listAgents,
+  listAgentTokens,
+  revokeAgentToken,
+} from "./api";
+import type { Agent, AgentToken, CreatedAgentToken } from "./types";
+
+interface AgentsPageProps {
+  isAdmin: boolean;
+  onOpenHome: () => void;
+  onOpenRooms: () => void;
+  onOpenAdmin: () => void;
+  onEnterRoom: (room?: string) => void;
+  onShowToast: (message: string) => void;
+}
+
+type AgentsTab = "agents" | "tokens";
+
+// startCommand 渲染「拿着这个 token 启动 bridge」的示例命令。token 明文只在
+// 生成弹层里出现一次，因此该命令也只在那一刻可复制。
+function startCommand(token: string): string {
+  return `AGENT_ROOM_AGENT_TOKEN=${token} agent-room bridge`;
+}
+
+export function AgentsPage({
+  isAdmin,
+  onOpenHome,
+  onOpenRooms,
+  onOpenAdmin,
+  onEnterRoom,
+  onShowToast,
+}: AgentsPageProps) {
+  const { me, signOut } = useAuth();
+  const [tab, setTab] = useState<AgentsTab>("agents");
+
+  const right =
+    me.auth_enabled && me.authenticated ? (
+      <div className="home-nav-actions">
+        <PageNav
+          current="agents"
+          isAdmin={isAdmin}
+          onOpenHome={onOpenHome}
+          onOpenRooms={onOpenRooms}
+          onOpenAdmin={onOpenAdmin}
+          onOpenAgents={() => {}}
+        />
+        <UserMenu user={me.user} isAdmin={isAdmin} onSignOut={signOut} />
+      </div>
+    ) : null;
+
+  return (
+    <div className="home">
+      <TopBrand right={right} />
+      <main className="home-main">
+        <div className="home-hero">
+          <span className="kicker">
+            <Icon name="bot" size={14} /> 我的 Agents
+          </span>
+          <h1>管理我的 Agent</h1>
+          <p>
+            这里集中管理你名下的 Agent：查看在线状态与所在房间、复制 ID、解绑，
+            以及生成用于把本机 bridge 绑定到账号的接入 Token。
+          </p>
+        </div>
+
+        <div className="admin-tabs" role="tablist" aria-label="Agent 管理分区">
+          <button
+            type="button"
+            className={tab === "agents" ? "on" : ""}
+            onClick={() => setTab("agents")}
+            role="tab"
+            aria-selected={tab === "agents"}
+          >
+            <Icon name="bot" size={15} /> 我的 Agents
+          </button>
+          <button
+            type="button"
+            className={tab === "tokens" ? "on" : ""}
+            onClick={() => setTab("tokens")}
+            role="tab"
+            aria-selected={tab === "tokens"}
+          >
+            <Icon name="lock" size={15} /> 接入 Token
+          </button>
+        </div>
+
+        {tab === "agents" ? (
+          <AgentsList onEnterRoom={onEnterRoom} onShowToast={onShowToast} onGoTokens={() => setTab("tokens")} />
+        ) : (
+          <TokensPanel onShowToast={onShowToast} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+/* ── 我的 Agents 列表 ──────────────────────────────────────────────── */
+
+function AgentsList({
+  onEnterRoom,
+  onShowToast,
+  onGoTokens,
+}: {
+  onEnterRoom: (room?: string) => void;
+  onShowToast: (message: string) => void;
+  onGoTokens: () => void;
+}) {
+  const [agents, setAgents] = useState<Agent[] | null>(null);
+  const [error, setError] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    setError(false);
+    listAgents()
+      .then((list) => setAgents(list))
+      .catch(() => {
+        setAgents([]);
+        setError(true);
+      });
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const unbind = useCallback(
+    (agentID: string) => {
+      deleteAgent(agentID)
+        .then(() => {
+          onShowToast("已解绑该 Agent");
+          setConfirming(null);
+          setExpanded(null);
+          refresh();
+        })
+        .catch(() => onShowToast("解绑失败，请稍后重试"));
+    },
+    [onShowToast, refresh],
+  );
+
+  function copyID(agentID: string) {
+    copyText(agentID).then(
+      () => onShowToast("Agent ID 已复制"),
+      () => onShowToast("复制失败"),
+    );
+  }
+
+  return (
+    <section className="home-rooms" aria-label="我的 Agents">
+      <div className="home-rooms-head">
+        <span>名下 Agent</span>
+        <span className="count">{agents ? agents.length : "…"}</span>
+        <button
+          type="button"
+          className="icon-btn icon-btn-ghost"
+          onClick={refresh}
+          title="刷新"
+          aria-label="刷新"
+          style={{ marginLeft: "auto" }}
+        >
+          <Icon name="refresh" size={15} />
+        </button>
+      </div>
+
+      {agents === null ? (
+        <p className="home-fine">正在加载 Agent 列表…</p>
+      ) : error ? (
+        <p className="home-fine">加载失败：可能未登录或服务暂不可用。</p>
+      ) : agents.length === 0 ? (
+        <AgentsEmpty onGoTokens={onGoTokens} />
+      ) : (
+        <ul className="agent-mgr-list">
+          {agents.map((agent) => (
+            <li key={agent.agent_id} className="agent-mgr-row">
+              <div className="agent-mgr-main">
+                <span className={agent.online ? "agent-mgr-status on" : "agent-mgr-status"}>
+                  <StatusDot tone={agent.online ? "live" : "off"} pulse={agent.online} size={8} />
+                </span>
+                <div className="agent-mgr-text">
+                  <div className="agent-mgr-title">
+                    <strong>{agent.label || agent.agent_id}</strong>
+                    {agent.provider && <span className="agent-mgr-provider">{agent.provider}</span>}
+                  </div>
+                  <div className="agent-mgr-meta">
+                    <button
+                      type="button"
+                      className="agent-mgr-id"
+                      onClick={() => copyID(agent.agent_id)}
+                      title="点击复制完整 Agent ID"
+                    >
+                      <Icon name="copy" size={12} /> {shortAgentID(agent.agent_id)}
+                    </button>
+                    <span>
+                      {agent.online ? "在线" : "离线"}
+                      {!agent.online && relativeAge(agent.last_seen_at)
+                        ? ` · 最后在线 ${relativeAge(agent.last_seen_at)}`
+                        : ""}
+                    </span>
+                  </div>
+                  {agent.online && agent.rooms && agent.rooms.length > 0 && (
+                    <div className="agent-mgr-rooms">
+                      {agent.rooms.map((roomID) => (
+                        <button
+                          key={roomID}
+                          type="button"
+                          className="agent-mgr-room"
+                          onClick={() => onEnterRoom(roomID)}
+                          title={`进入房间 ${roomID}`}
+                        >
+                          <Icon name="hash" size={12} /> {shortRoomID(roomID)}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="agent-mgr-actions">
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => setExpanded((cur) => (cur === agent.agent_id ? null : agent.agent_id))}
+                  aria-expanded={expanded === agent.agent_id}
+                >
+                  <Icon name="settings" size={14} /> 配置
+                </button>
+                {confirming === agent.agent_id ? (
+                  <span className="agent-mgr-confirm">
+                    <button type="button" className="btn btn-sm btn-danger" onClick={() => unbind(agent.agent_id)}>
+                      确认解绑
+                    </button>
+                    <button type="button" className="btn btn-sm" onClick={() => setConfirming(null)}>
+                      取消
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-danger"
+                    onClick={() => setConfirming(agent.agent_id)}
+                  >
+                    <Icon name="trash" size={14} /> 解绑
+                  </button>
+                )}
+              </div>
+
+              {expanded === agent.agent_id && (
+                <div className="agent-mgr-config">
+                  <AgentConfigPlaceholder />
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// AgentConfigPlaceholder 是配置编辑区的占位。后端配置 API（model /
+// api_base_url / api_key 的 GET 回显与 PUT 保存，见 issue #3）尚未落地，因此这里
+// 先以禁用态展示规划中的字段，避免实现者自由发挥，也让用户知道功能即将上线。
+function AgentConfigPlaceholder() {
+  return (
+    <div className="agent-config-soon" aria-label="配置编辑（即将上线）">
+      <div className="agent-config-soon-head">
+        <Icon name="settings" size={14} />
+        <strong>配置编辑即将上线</strong>
+        <span className="chip chip-mono">依赖 #3</span>
+      </div>
+      <p className="home-fine">
+        模型与 API 凭据的在线编辑正在开发中。上线后可在此设置：
+      </p>
+      <div className="agent-config-fields" aria-hidden>
+        <label>
+          <span>模型 model</span>
+          <input type="text" placeholder="claude-sonnet-4-6" disabled />
+        </label>
+        <label>
+          <span>API 地址 api_base_url</span>
+          <input type="text" placeholder="https://api.anthropic.com" disabled />
+        </label>
+        <label>
+          <span>API Key</span>
+          <input type="password" placeholder="sk-***abcd" disabled />
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function AgentsEmpty({ onGoTokens }: { onGoTokens: () => void }) {
+  return (
+    <div className="rooms-empty">
+      <Icon name="bot" size={18} />
+      <strong>还没有绑定的 Agent</strong>
+      <span>
+        生成一个接入 Token，用它启动本机 bridge，Agent 连接后会出现在这里（含离线）。
+      </span>
+      <button type="button" className="btn" onClick={onGoTokens} style={{ marginTop: 10 }}>
+        <Icon name="lock" size={14} /> 去生成接入 Token
+      </button>
+    </div>
+  );
+}
+
+function shortAgentID(value: string): string {
+  if (value.length <= 16) return value;
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
+/* ── 接入 Token ────────────────────────────────────────────────────── */
+
+function TokensPanel({ onShowToast }: { onShowToast: (message: string) => void }) {
+  const [tokens, setTokens] = useState<AgentToken[] | null>(null);
+  const [error, setError] = useState(false);
+  const [note, setNote] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState<CreatedAgentToken | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    setError(false);
+    listAgentTokens()
+      .then((list) => setTokens(list))
+      .catch(() => {
+        setTokens([]);
+        setError(true);
+      });
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const generate = useCallback(() => {
+    setCreating(true);
+    createAgentToken(note.trim() || undefined)
+      .then((res) => {
+        setCreated(res);
+        setNote("");
+        refresh();
+      })
+      .catch(() => onShowToast("生成失败，请稍后重试"))
+      .finally(() => setCreating(false));
+  }, [note, refresh, onShowToast]);
+
+  const revoke = useCallback(
+    (prefix: string) => {
+      revokeAgentToken(prefix)
+        .then(() => {
+          onShowToast("Token 已吊销");
+          setConfirming(null);
+          refresh();
+        })
+        .catch(() => onShowToast("吊销失败，请稍后重试"));
+    },
+    [onShowToast, refresh],
+  );
+
+  return (
+    <section className="home-rooms" aria-label="接入 Token">
+      <div className="token-create-card">
+        <div className="home-card-head">
+          <div>
+            <h2>生成接入 Token</h2>
+            <p>用它把本机 bridge 绑定到你的账号。明文只展示一次，关闭后无法再次查看。</p>
+          </div>
+          <Icon name="lock" size={21} />
+        </div>
+        <div className="token-create-form">
+          <input
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="备注（可选，如「办公室 Mac」）"
+            aria-label="Token 备注"
+            maxLength={120}
+            spellCheck={false}
+          />
+          <button type="button" className="btn btn-primary" onClick={generate} disabled={creating}>
+            {creating ? "正在生成…" : (
+              <>
+                <Icon name="plus" size={15} /> 生成 Token
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      <div className="home-rooms-head" style={{ marginTop: 20 }}>
+        <span>已有 Token</span>
+        <span className="count">{tokens ? tokens.length : "…"}</span>
+        <button
+          type="button"
+          className="icon-btn icon-btn-ghost"
+          onClick={refresh}
+          title="刷新"
+          aria-label="刷新"
+          style={{ marginLeft: "auto" }}
+        >
+          <Icon name="refresh" size={15} />
+        </button>
+      </div>
+
+      {tokens === null ? (
+        <p className="home-fine">正在加载 Token 列表…</p>
+      ) : error ? (
+        <p className="home-fine">加载失败：可能未登录或服务暂不可用。</p>
+      ) : tokens.length === 0 ? (
+        <p className="home-fine">还没有接入 Token。生成一个即可绑定本机 bridge。</p>
+      ) : (
+        <ul className="token-list">
+          {tokens.map((token) => (
+            <li key={token.hash_prefix} className="token-row">
+              <div className="token-row-main">
+                <code className="token-prefix">{token.hash_prefix}…</code>
+                {token.note && <span className="token-note">{token.note}</span>}
+                <div className="token-row-meta">
+                  <span>
+                    <Icon name="clock" size={12} /> 创建 {relativeAge(token.created_at) || "刚刚"}
+                  </span>
+                  <span>
+                    <Icon name="activity" size={12} />{" "}
+                    {token.last_used_at ? `最近使用 ${relativeAge(token.last_used_at)}` : "从未使用"}
+                  </span>
+                </div>
+              </div>
+              {confirming === token.hash_prefix ? (
+                <span className="agent-mgr-confirm">
+                  <button type="button" className="btn btn-sm btn-danger" onClick={() => revoke(token.hash_prefix)}>
+                    确认吊销
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setConfirming(null)}>
+                    取消
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger"
+                  onClick={() => setConfirming(token.hash_prefix)}
+                >
+                  <Icon name="trash" size={14} /> 吊销
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {created && (
+        <NewTokenDialog token={created} onClose={() => setCreated(null)} onShowToast={onShowToast} />
+      )}
+    </section>
+  );
+}
+
+// NewTokenDialog 一次性展示明文 token + 启动示例命令。关闭后无法再次查看。
+function NewTokenDialog({
+  token,
+  onClose,
+  onShowToast,
+}: {
+  token: CreatedAgentToken;
+  onClose: () => void;
+  onShowToast: (message: string) => void;
+}) {
+  const command = startCommand(token.token);
+
+  function copyToken() {
+    copyText(token.token).then(
+      () => onShowToast("Token 已复制"),
+      () => onShowToast("复制失败"),
+    );
+  }
+
+  function copyCommand() {
+    copyText(command).then(
+      () => onShowToast("启动命令已复制"),
+      () => onShowToast("复制失败"),
+    );
+  }
+
+  return (
+    <div className="token-dialog-backdrop" role="dialog" aria-modal="true" aria-label="新生成的接入 Token">
+      <div className="token-dialog">
+        <div className="token-dialog-head">
+          <h3>
+            <Icon name="check" size={16} /> Token 已生成
+          </h3>
+          <button type="button" className="icon-btn icon-btn-ghost" onClick={onClose} aria-label="关闭">
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+        <p className="token-dialog-warn">
+          <Icon name="alert" size={14} /> 明文只展示这一次，关闭后无法再次查看，请立即复制保存。
+        </p>
+
+        <label className="token-dialog-field">
+          <span>Token 明文</span>
+          <div className="token-dialog-copy">
+            <code>{token.token}</code>
+            <button type="button" className="btn btn-sm" onClick={copyToken}>
+              <Icon name="copy" size={14} /> 复制
+            </button>
+          </div>
+        </label>
+
+        <label className="token-dialog-field">
+          <span>启动 bridge 示例命令</span>
+          <div className="token-dialog-copy">
+            <code>{command}</code>
+            <button type="button" className="btn btn-sm" onClick={copyCommand}>
+              <Icon name="copy" size={14} /> 复制
+            </button>
+          </div>
+        </label>
+        <p className="home-fine">
+          需要指定房间时追加 <code>--room &lt;room_id&gt;</code>。
+        </p>
+
+        <div className="token-dialog-foot">
+          <button type="button" className="btn btn-primary" onClick={onClose}>
+            我已保存，关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

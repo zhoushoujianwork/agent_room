@@ -116,6 +116,40 @@ export interface AdminUsersReport {
   trend: UserTrendPoint[];
 }
 
+/* ── Agents (用户维度自管理) ─────────────────────────────────────── */
+
+// Agent 是 GET /v1/agents 返回的一行，与 Go 侧 models.Agent 对偶：持久化的
+// agent↔owner 绑定，online / rooms 为读取时由 hub 在线状态合并的运行期字段。
+export interface Agent {
+  agent_id: string;
+  owner_login: string;
+  label: string;
+  provider: string;
+  created_at: string;
+  last_seen_at: string;
+  revoked: boolean;
+  online: boolean;
+  rooms?: string[];
+}
+
+// AgentToken 是 GET /v1/agents/tokens 列表里的脱敏一行：只含哈希前缀与元信息，
+// 永远不含明文。
+export interface AgentToken {
+  hash_prefix: string;
+  note: string;
+  created_at: string;
+  last_used_at?: string | null;
+}
+
+// CreatedAgentToken 是 POST /v1/agents/tokens 的响应体：明文 token 仅在此刻
+// 返回一次，关闭后无法再次查看。
+export interface CreatedAgentToken {
+  token: string;
+  hash_prefix: string;
+  note: string;
+  created_at: string;
+}
+
 /* ── Room summary (LLM 滚动摘要) ─────────────────────────────────── */
 
 export interface RoomSummary {
