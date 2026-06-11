@@ -210,9 +210,44 @@ func (h *hub) pushAgentConfig(ctx context.Context, c *client, agentID string) {
 	h.sendConfigUpdateToClient(c, agentID, *cfg)
 }
 
-// sendConfigUpdate delivers cfg to every live connection of agentID across all
-// rooms. Used after a PUT so an online agent gets the change immediately.
+// sendConfigUpdate delivers cfg to agentID. It first tries the agent-level
+// control connection; if none is available it falls back to every live room
+// connection for that agent. Neither path goes through Publish or history.
 func (h *hub) sendConfigUpdate(agentID string, cfg models.AgentConfig) {
+	// Build the message once so both paths share the same payload.
+	apiKey := ""
+	if strings.TrimSpace(cfg.APIKeyCipher) != "" {
+		plain, err := decryptSecret(h.secretKey, cfg.APIKeyCipher)
+		if err != nil {
+			h.logger.Warn("decrypt agent api_key for downstream failed",
+				slog.String("agent_id", agentID), slog.Any("error", err))
+		} else {
+			apiKey = plain
+		}
+	}
+	meta := map[string]string{
+		"operation":    models.ControlOperationConfigUpdate,
+		"model":        cfg.Model,
+		"api_base_url": cfg.APIBaseURL,
+	}
+	if apiKey != "" {
+		meta["api_key"] = apiKey
+	}
+	msg := models.ChatMessage{
+		Type:       models.MessageTypeControl,
+		SenderKind: models.SenderKindSystem,
+		TargetID:   agentID,
+		CreatedAt:  time.Now().UTC(),
+		Metadata:   meta,
+	}
+	// Prefer control connection; fall back to room connections.
+	if h.sendToAgentCtrl(agentID, msg) {
+		h.logger.Info("config_update delivered via ctrl",
+			slog.String("agent_id", agentID),
+			slog.String("model", cfg.Model))
+		return
+	}
+	// Fallback: deliver over every room connection.
 	h.mu.RLock()
 	var targets []*client
 	for _, clients := range h.rooms {
@@ -227,6 +262,8 @@ func (h *hub) sendConfigUpdate(agentID string, cfg models.AgentConfig) {
 	}
 	h.mu.RUnlock()
 	for _, c := range targets {
+		roomMsg := msg
+		roomMsg.RoomID = c.roomID
 		h.sendConfigUpdateToClient(c, agentID, cfg)
 	}
 }
@@ -275,6 +312,29 @@ func (h *hub) sendConfigUpdateToClient(c *client, agentID string, cfg models.Age
 		h.logger.Warn("dropping config_update for slow client",
 			slog.String("agent_id", agentID), slog.String("room_id", c.roomID))
 	}
+}
+
+// sendToAgentCtrl delivers msg to all control connections for agentID.
+// Non-blocking per connection; returns true if at least one delivery succeeded.
+// Messages sent via this path NEVER go through Publish and NEVER enter history.
+func (h *hub) sendToAgentCtrl(agentID string, msg models.ChatMessage) bool {
+	h.mu.RLock()
+	set := h.agentCtrl[agentID]
+	targets := make([]*client, 0, len(set))
+	for c := range set {
+		targets = append(targets, c)
+	}
+	h.mu.RUnlock()
+	delivered := false
+	for _, c := range targets {
+		select {
+		case c.send <- outgoing(msg):
+			delivered = true
+		default:
+			h.logger.Warn("dropping ctrl msg for slow client", slog.String("agent_id", agentID))
+		}
+	}
+	return delivered
 }
 
 // closeAgentConnections closes every live connection whose participant ID

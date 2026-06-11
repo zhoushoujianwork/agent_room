@@ -35,6 +35,12 @@ const (
 	// logging. The bridge applies it to its provider's in-memory runtime
 	// config; an empty field means "fall back to the bridge local default".
 	ControlOperationConfigUpdate = "config_update"
+	// ControlOperationJoinRoom 指示 bridge 建立到指定房间的连接（relay→bridge，仅控制连接）。
+	ControlOperationJoinRoom = "join_room"
+	// ControlOperationLeaveRoom 指示 bridge 断开指定房间的连接（relay→bridge，仅控制连接）。
+	ControlOperationLeaveRoom = "leave_room"
+	// ControlOperationRoomStateReport 是 bridge 上报当前实际已连接房间列表（bridge→relay，仅控制连接）。
+	ControlOperationRoomStateReport = "room_state_report"
 )
 
 type SenderKind string
