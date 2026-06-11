@@ -162,16 +162,22 @@ func (s *Store) ListAgentTokensByOwner(_ context.Context, owner string) ([]model
 func (s *Store) RevokeAgentTokenByPrefix(_ context.Context, owner, prefix string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := 0
+	// Collect matching hashes first; only revoke if exactly one matches.
+	var matches []string
 	for hash, t := range s.agentTokens {
 		if t.Revoked || t.OwnerLogin != owner || !strings.HasPrefix(hash, prefix) {
 			continue
 		}
-		t.Revoked = true
-		s.agentTokens[hash] = t
-		n++
+		matches = append(matches, hash)
 	}
-	return n, nil
+	if len(matches) != 1 {
+		// 0 → not found; >1 → ambiguous prefix — do not revoke anything.
+		return len(matches), nil
+	}
+	t := s.agentTokens[matches[0]]
+	t.Revoked = true
+	s.agentTokens[matches[0]] = t
+	return 1, nil
 }
 
 func sortAgents(agents []models.Agent) {

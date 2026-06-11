@@ -164,20 +164,41 @@ func (s *Store) ListAgentTokensByOwner(ctx context.Context, owner string) ([]mod
 	return out, nil
 }
 
-// RevokeAgentTokenByPrefix marks all of this owner's active tokens whose hash
-// starts with prefix as revoked, returning how many matched. The owner scope
-// guarantees a user can only revoke their own tokens. The caller decides how to
-// treat 0 (not found) vs >1 (ambiguous prefix).
+// RevokeAgentTokenByPrefix revokes the single active token whose hash starts
+// with prefix for the given owner. If the prefix matches zero tokens, (0, nil)
+// is returned so the caller can 404. If the prefix matches more than one token
+// the operation is aborted and (n, nil) is returned with n>1 so the caller can
+// 409 — no tokens are revoked in this case. Atomicity is ensured by running
+// the count and update inside the same transaction with a LIKE predicate.
 func (s *Store) RevokeAgentTokenByPrefix(ctx context.Context, owner, prefix string) (int, error) {
-	res, err := s.db.ExecContext(ctx, `
-        UPDATE agent_tokens SET revoked = 1
-        WHERE owner_login = ? AND revoked = 0 AND token_hash LIKE ? || '%'`,
-		owner, prefix)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return 0, fmt.Errorf("sqlite revoke agent token begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM agent_tokens
+		WHERE owner_login = ? AND revoked = 0 AND token_hash LIKE ? || '%'`,
+		owner, prefix).Scan(&count); err != nil {
+		return 0, fmt.Errorf("sqlite revoke agent token count: %w", err)
+	}
+	if count != 1 {
+		// 0 → not found; >1 → ambiguous prefix — do not revoke anything.
+		return count, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE agent_tokens SET revoked = 1
+		WHERE owner_login = ? AND revoked = 0 AND token_hash LIKE ? || '%'`,
+		owner, prefix); err != nil {
 		return 0, fmt.Errorf("sqlite revoke agent token: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("sqlite revoke agent token commit: %w", err)
+	}
+	return 1, nil
 }
 
 func scanAgent(sc scanner) (*models.Agent, error) {

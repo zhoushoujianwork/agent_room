@@ -175,6 +175,9 @@ func (s *Server) handleAgentItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Kick any live connections for this agent so the bridge re-authenticates
+	// immediately rather than staying online until natural disconnect.
+	s.hub.closeAgentConnections(agentID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -291,10 +294,13 @@ func (s *Server) handleAgentTokenItem(w http.ResponseWriter, r *http.Request) {
 	case n == 0:
 		writeError(w, http.StatusNotFound, "token not found")
 	case n > 1:
-		// Ambiguous prefix matched multiple tokens; we already revoked them
-		// all (fail-safe), but tell the caller their handle was not unique.
-		writeError(w, http.StatusConflict, "ambiguous hash prefix matched multiple tokens (all revoked)")
+		// Ambiguous prefix matched multiple tokens; nothing was revoked.
+		// The caller should retry with a longer prefix.
+		writeError(w, http.StatusConflict, "ambiguous hash prefix matched multiple tokens (nothing revoked; use a longer prefix)")
 	default:
+		// Token revoked: kick any live connections that authenticated with
+		// this owner's token so they re-authenticate immediately.
+		s.hub.closeOwnerConnections(login)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
 }

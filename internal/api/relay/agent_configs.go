@@ -26,10 +26,14 @@ type agentConfigResponse struct {
 // agentConfigUpdate is the PUT body. Pointer fields distinguish "absent (keep
 // current)" from "present empty string (clear)". api_key present+non-empty
 // overwrites; present+empty clears; absent keeps.
+// expect_updated_at is an optional optimistic-lock guard: when present, the
+// request is rejected with 409 if the stored updated_at does not match,
+// preventing silent last-write-wins overwrites in concurrent-edit scenarios.
 type agentConfigUpdate struct {
-	Model      *string `json:"model"`
-	APIBaseURL *string `json:"api_base_url"`
-	APIKey     *string `json:"api_key"`
+	Model          *string    `json:"model"`
+	APIBaseURL     *string    `json:"api_base_url"`
+	APIKey         *string    `json:"api_key"`
+	ExpectUpdatedAt *time.Time `json:"expect_updated_at,omitempty"`
 }
 
 // handleAgentConfig serves GET/PUT /v1/agents/{agent_id}/config. Owner-or-admin
@@ -108,6 +112,21 @@ func (s *Server) putAgentConfig(w http.ResponseWriter, r *http.Request, agentID,
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Optimistic-lock guard: if the caller supplied expect_updated_at, reject
+	// the write when the stored timestamp doesn't match. This prevents a
+	// concurrent PUT from silently overwriting another writer's changes.
+	if body.ExpectUpdatedAt != nil {
+		var storedAt time.Time
+		if current != nil {
+			storedAt = current.UpdatedAt
+		}
+		if !storedAt.Equal(*body.ExpectUpdatedAt) {
+			writeError(w, http.StatusConflict, "config was modified by another request; fetch the latest version and retry")
+			return
+		}
+	}
+
 	next := models.AgentConfig{AgentID: agentID}
 	if current != nil {
 		next.Model = current.Model
@@ -255,5 +274,58 @@ func (h *hub) sendConfigUpdateToClient(c *client, agentID string, cfg models.Age
 	default:
 		h.logger.Warn("dropping config_update for slow client",
 			slog.String("agent_id", agentID), slog.String("room_id", c.roomID))
+	}
+}
+
+// closeAgentConnections closes every live connection whose participant ID
+// matches agentID. Used when an agent is unbound (DELETE /v1/agents/{id}) so
+// the bridge is kicked immediately rather than lingering until natural
+// reconnect. The bridge's own reconnect logic will then re-authenticate and
+// receive a 401 / anonymous downgrade as appropriate.
+func (h *hub) closeAgentConnections(agentID string) {
+	h.mu.RLock()
+	var targets []*client
+	for _, clients := range h.rooms {
+		for c := range clients {
+			if c.audit {
+				continue
+			}
+			if c.participant.Kind == models.SenderKindAgent && c.participant.ID == agentID {
+				targets = append(targets, c)
+			}
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		h.logger.Info("closing agent connection: agent unbound",
+			slog.String("agent_id", agentID),
+			slog.String("room_id", c.roomID))
+		_ = c.conn.Close()
+	}
+}
+
+// closeOwnerConnections closes every live agent connection whose resolved
+// owner matches ownerLogin. Used when a token is revoked so any bridge that
+// authenticated with that owner's token is kicked immediately.
+func (h *hub) closeOwnerConnections(ownerLogin string) {
+	h.mu.RLock()
+	var targets []*client
+	for _, clients := range h.rooms {
+		for c := range clients {
+			if c.audit {
+				continue
+			}
+			if c.participant.Kind == models.SenderKindAgent && c.owner == ownerLogin {
+				targets = append(targets, c)
+			}
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		h.logger.Info("closing agent connection: token revoked",
+			slog.String("owner", ownerLogin),
+			slog.String("agent_id", c.participant.ID),
+			slog.String("room_id", c.roomID))
+		_ = c.conn.Close()
 	}
 }

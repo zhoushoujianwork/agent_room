@@ -221,3 +221,110 @@ func getAgents(t *testing.T, s *Server, login string) []models.Agent {
 	}
 	return out.Agents
 }
+
+// TestAgentTokenRevokeAmbiguousPrefixRejectsWithoutRevoking verifies fix①:
+// when a short prefix matches more than one token, the API returns 409 and
+// neither token is actually revoked.
+func TestAgentTokenRevokeAmbiguousPrefixRejectsWithoutRevoking(t *testing.T) {
+	s := newAdminServer(t, agentTestSecret, "root")
+	ctx := context.Background()
+
+	// Create two tokens and manufacture a shared prefix by forcing the same
+	// first 4 chars into the store directly, bypassing the real hash.
+	const sharedPrefix = "aabb"
+	err := s.agents.InsertAgentToken(ctx, models.AgentToken{
+		TokenHash:  sharedPrefix + "ccdd000001",
+		HashPrefix: sharedPrefix,
+		OwnerLogin: "alice",
+		Note:       "t1",
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("insert t1: %v", err)
+	}
+	err = s.agents.InsertAgentToken(ctx, models.AgentToken{
+		TokenHash:  sharedPrefix + "ccdd000002",
+		HashPrefix: sharedPrefix,
+		OwnerLogin: "alice",
+		Note:       "t2",
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("insert t2: %v", err)
+	}
+
+	// DELETE with the shared 4-char prefix → must return 409.
+	req := httptest.NewRequest(http.MethodDelete, "/v1/agents/tokens/"+sharedPrefix, nil)
+	req.AddCookie(signedCookie(t, agentTestSecret, "alice"))
+	rr := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("ambiguous revoke = %d, want 409; body=%s", rr.Code, rr.Body.String())
+	}
+
+	// Both tokens must still be valid (not revoked).
+	tokens, err := s.agents.ListAgentTokensByOwner(ctx, "alice")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("expected 2 active tokens after rejected ambiguous revoke, got %d", len(tokens))
+	}
+}
+
+// TestAgentUnbindClosesOnlineConnection verifies fix②:
+// DELETE /v1/agents/{id} closes the bridge's live WebSocket connection.
+func TestAgentUnbindClosesOnlineConnection(t *testing.T) {
+	s := newAdminServer(t, agentTestSecret, "root")
+	token, _ := createTokenForUser(t, s, "alice")
+
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsBase+"/v1/rooms/demo/ws?agent_token="+token, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send presence to bind the agent row.
+	if err := conn.WriteJSON(models.ChatMessage{
+		ID: "p1", RoomID: "demo", Type: models.MessageTypePresence,
+		SenderID: "ag-close-test", SenderKind: models.SenderKindAgent,
+	}); err != nil {
+		t.Fatalf("write presence: %v", err)
+	}
+
+	// Wait for agent row to appear.
+	for range 50 {
+		if a, err := s.agents.GetAgent(context.Background(), "ag-close-test"); err == nil && a != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Unbind via API — this should close the WS connection.
+	req := httptest.NewRequest(http.MethodDelete, "/v1/agents/ag-close-test", nil)
+	req.AddCookie(signedCookie(t, agentTestSecret, "alice"))
+	rr := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unbind = %d; body=%s", rr.Code, rr.Body.String())
+	}
+
+	// The server closes the underlying TCP connection after unbind.
+	// Drain any queued frames (e.g. an echo/config message) until we get an
+	// error — the connection must close within the deadline.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	closed := false
+	for range 20 {
+		if err := conn.ReadJSON(&struct{}{}); err != nil {
+			closed = true
+			break
+		}
+	}
+	if !closed {
+		t.Fatalf("expected connection to be closed after unbind, but kept receiving messages")
+	}
+}
