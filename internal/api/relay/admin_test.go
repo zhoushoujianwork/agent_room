@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"agent-room/internal/config"
 	"agent-room/internal/io/memory"
@@ -177,6 +178,81 @@ func TestAdminRoomsAuthDisabled404(t *testing.T) {
 	s.Routes().ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("auth-disabled list = %d, want 404", rr.Code)
+	}
+}
+
+func TestAdminUsersEndpoint(t *testing.T) {
+	secret := "secret-32-bytes-or-so-here-12345"
+	s := newAdminServer(t, secret, "root")
+	now := time.Now().UTC()
+
+	if err := s.rooms.RecordUserActivity(t.Context(), models.UserActivity{
+		Login:       "alice",
+		Name:        "Alice",
+		Email:       "alice@example.com",
+		FirstSeenAt: now.Add(-48 * time.Hour),
+		LastLoginAt: now.Add(-2 * time.Hour),
+		LoginCount:  3,
+	}, false); err != nil {
+		t.Fatalf("seed user activity: %v", err)
+	}
+	owner := "alice"
+	if err := s.rooms.CreateRoom(t.Context(), models.Room{
+		ID:         "alice-room",
+		OwnerLogin: &owner,
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatalf("seed room: %v", err)
+	}
+	online := &client{
+		roomID: "alice-room",
+		send:   make(chan outgoing, 1),
+		participant: models.Participant{
+			ID:          "alice",
+			RoomID:      "alice-room",
+			Kind:        models.SenderKindUser,
+			Label:       "Alice",
+			ConnectedAt: now.Add(-10 * time.Minute),
+			LastSeenAt:  now.Add(-1 * time.Minute),
+		},
+	}
+	s.hub.register(online)
+	defer s.hub.unregister(online)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/users", nil)
+	req.AddCookie(signedCookie(t, secret, "root"))
+	rr := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("admin users = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var report models.AdminUsersReport
+	if err := json.NewDecoder(rr.Body).Decode(&report); err != nil {
+		t.Fatalf("decode report: %v", err)
+	}
+	if report.TotalUsers != 1 || report.OnlineUsers != 1 {
+		t.Fatalf("totals = users %d online %d, want 1/1", report.TotalUsers, report.OnlineUsers)
+	}
+	if len(report.Trend) != 7 {
+		t.Fatalf("trend len = %d, want 7", len(report.Trend))
+	}
+	if len(report.Users) != 1 {
+		t.Fatalf("users len = %d, want 1", len(report.Users))
+	}
+	got := report.Users[0]
+	if got.Login != "alice" || !got.Online || got.ConnectionCount != 1 || got.RoomsCreated != 1 {
+		t.Fatalf("alice row = %+v, want online with one connection and one room", got)
+	}
+	if len(got.OnlineRoomIDs) != 1 || got.OnlineRoomIDs[0] != "alice-room" {
+		t.Fatalf("online rooms = %#v, want alice-room", got.OnlineRoomIDs)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/admin/users", nil)
+	req.AddCookie(signedCookie(t, secret, "alice"))
+	rr = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("non-admin users = %d, want 403", rr.Code)
 	}
 }
 

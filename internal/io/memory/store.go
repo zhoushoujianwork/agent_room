@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"agent-room/internal/models"
 )
@@ -19,6 +21,7 @@ type Store struct {
 	messages  map[string][]models.ChatMessage
 	rooms     map[string]models.Room
 	requests  map[string]models.AccessRequest
+	users     map[string]models.UserActivity
 	summaries map[string]models.RoomSummary
 	// attachments 以 roomID -> attachmentID 双键存,镜像 SQLite 的
 	// (room_id, id) 查询口径:不知道房间 id 拿不到字节。
@@ -34,6 +37,7 @@ func NewStore() *Store {
 		messages:    make(map[string][]models.ChatMessage),
 		rooms:       make(map[string]models.Room),
 		requests:    make(map[string]models.AccessRequest),
+		users:       make(map[string]models.UserActivity),
 		summaries:   make(map[string]models.RoomSummary),
 		attachments: make(map[string]map[string]models.Attachment),
 		msgSeq:      make(map[string]int64),
@@ -124,6 +128,62 @@ func (s *Store) ListRooms(_ context.Context, limit, offset int) ([]models.Room, 
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+func (s *Store) RecordUserActivity(_ context.Context, user models.UserActivity, incrementLogin bool) error {
+	login := strings.TrimSpace(user.Login)
+	if login == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := user.LastLoginAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	existing, ok := s.users[login]
+	if !ok {
+		firstSeen := user.FirstSeenAt
+		if firstSeen.IsZero() {
+			firstSeen = now
+		}
+		user.Login = login
+		user.FirstSeenAt = firstSeen
+		user.LastLoginAt = now
+		if user.LoginCount <= 0 {
+			user.LoginCount = 1
+		}
+		s.users[login] = user
+		return nil
+	}
+	if strings.TrimSpace(user.Name) != "" {
+		existing.Name = strings.TrimSpace(user.Name)
+	}
+	if strings.TrimSpace(user.Email) != "" {
+		existing.Email = strings.TrimSpace(user.Email)
+	}
+	if strings.TrimSpace(user.AvatarURL) != "" {
+		existing.AvatarURL = strings.TrimSpace(user.AvatarURL)
+	}
+	if incrementLogin {
+		existing.LastLoginAt = now
+		existing.LoginCount++
+	}
+	s.users[login] = existing
+	return nil
+}
+
+func (s *Store) ListUserActivities(_ context.Context) ([]models.UserActivity, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]models.UserActivity, 0, len(s.users))
+	for _, user := range s.users {
+		out = append(out, user)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastLoginAt.After(out[j].LastLoginAt)
+	})
 	return out, nil
 }
 

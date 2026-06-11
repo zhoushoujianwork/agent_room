@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"agent-room/internal/models"
@@ -89,6 +90,80 @@ func (s *Store) ListRooms(ctx context.Context, limit, offset int) ([]models.Room
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sqlite list rooms rows: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) RecordUserActivity(ctx context.Context, user models.UserActivity, incrementLogin bool) error {
+	login := strings.TrimSpace(user.Login)
+	if login == "" {
+		return nil
+	}
+	now := user.LastLoginAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	firstSeen := user.FirstSeenAt
+	if firstSeen.IsZero() {
+		firstSeen = now
+	}
+	increment := 0
+	if incrementLogin {
+		increment = 1
+	}
+	initialCount := increment
+	if initialCount == 0 {
+		initialCount = 1
+	}
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO user_activity (
+            login, name, email, avatar_url, first_seen_at, last_login_at, login_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(login) DO UPDATE SET
+            name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE user_activity.name END,
+            email = CASE WHEN excluded.email <> '' THEN excluded.email ELSE user_activity.email END,
+            avatar_url = CASE WHEN excluded.avatar_url <> '' THEN excluded.avatar_url ELSE user_activity.avatar_url END,
+            last_login_at = CASE
+                WHEN ? THEN excluded.last_login_at
+                ELSE user_activity.last_login_at
+            END,
+            login_count = user_activity.login_count + ?`,
+		login,
+		strings.TrimSpace(user.Name),
+		strings.TrimSpace(user.Email),
+		strings.TrimSpace(user.AvatarURL),
+		firstSeen.UTC().Format(time.RFC3339Nano),
+		now.UTC().Format(time.RFC3339Nano),
+		initialCount,
+		boolToInt(incrementLogin),
+		increment,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite record user activity: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListUserActivities(ctx context.Context) ([]models.UserActivity, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT login, name, email, avatar_url, first_seen_at, last_login_at, login_count
+        FROM user_activity
+        ORDER BY last_login_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list user_activity: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.UserActivity, 0)
+	for rows.Next() {
+		user, err := scanUserActivity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, user)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite list user_activity rows: %w", err)
 	}
 	return out, nil
 }
@@ -326,6 +401,35 @@ func scanAccessRequest(s scanner) (*models.AccessRequest, error) {
 		req.ResolvedAt = &ts
 	}
 	return req, nil
+}
+
+func scanUserActivity(s scanner) (models.UserActivity, error) {
+	var (
+		user                 models.UserActivity
+		firstSeen, lastLogin string
+	)
+	if err := s.Scan(
+		&user.Login,
+		&user.Name,
+		&user.Email,
+		&user.AvatarURL,
+		&firstSeen,
+		&lastLogin,
+		&user.LoginCount,
+	); err != nil {
+		return models.UserActivity{}, fmt.Errorf("sqlite scan user_activity: %w", err)
+	}
+	first, err := time.Parse(time.RFC3339Nano, firstSeen)
+	if err != nil {
+		return models.UserActivity{}, fmt.Errorf("sqlite parse user_activity first_seen_at %q: %w", firstSeen, err)
+	}
+	last, err := time.Parse(time.RFC3339Nano, lastLogin)
+	if err != nil {
+		return models.UserActivity{}, fmt.Errorf("sqlite parse user_activity last_login_at %q: %w", lastLogin, err)
+	}
+	user.FirstSeenAt = first
+	user.LastLoginAt = last
+	return user, nil
 }
 
 func nullableString(s *string) any {

@@ -106,6 +106,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("/v1/me", s.handleMe)
 	mux.HandleFunc("/v1/admin/rooms", s.handleAdminRooms)
+	mux.HandleFunc("/v1/admin/users", s.handleAdminUsers)
 	mux.HandleFunc("/v1/rooms", s.handleCreateRoom)
 	mux.HandleFunc("/v1/rooms/", s.handleRoom)
 	return mux
@@ -326,6 +327,120 @@ func (s *Server) handleAdminRooms(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rooms)
 }
 
+func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
+	if !s.authEnabled() {
+		writeError(w, http.StatusNotFound, "auth disabled")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.isAdminRequest(r) {
+		writeError(w, http.StatusForbidden, "admin only")
+		return
+	}
+	if s.rooms == nil {
+		writeError(w, http.StatusInternalServerError, "no room storage configured")
+		return
+	}
+	users, err := s.rooms.ListUserActivities(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rooms, err := s.rooms.ListRooms(r.Context(), 0, 0)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	report := buildAdminUsersReport(users, rooms, s.hub.UserPresence(), time.Now().UTC())
+	writeJSON(w, http.StatusOK, report)
+}
+
+func buildAdminUsersReport(users []models.UserActivity, rooms []models.Room, presence map[string]models.UserPresence, now time.Time) models.AdminUsersReport {
+	roomCounts := make(map[string]int)
+	for _, room := range rooms {
+		if room.OwnerLogin == nil {
+			continue
+		}
+		if login := strings.TrimSpace(*room.OwnerLogin); login != "" {
+			roomCounts[strings.ToLower(login)]++
+		}
+	}
+
+	byLogin := make(map[string]models.UserActivity, len(users)+len(presence))
+	for _, user := range users {
+		login := strings.TrimSpace(user.Login)
+		if login == "" {
+			continue
+		}
+		user.Login = login
+		byLogin[strings.ToLower(login)] = user
+	}
+	for login, p := range presence {
+		key := strings.ToLower(strings.TrimSpace(login))
+		if key == "" {
+			continue
+		}
+		user := byLogin[key]
+		if user.Login == "" {
+			user.Login = login
+			user.FirstSeenAt = now
+			user.LastLoginAt = now
+			user.LoginCount = 1
+		}
+		user.Online = true
+		user.ConnectionCount = p.ConnectionCount
+		user.OnlineRoomIDs = append([]string(nil), p.RoomIDs...)
+		user.LastSeenAt = p.LastSeenAt
+		byLogin[key] = user
+	}
+
+	out := make([]models.UserActivity, 0, len(byLogin))
+	since24h := now.Add(-24 * time.Hour)
+	since7d := now.AddDate(0, 0, -7)
+	report := models.AdminUsersReport{}
+	newByDay := make(map[string]int)
+	loginByDay := make(map[string]int)
+	for key, user := range byLogin {
+		user.RoomsCreated = roomCounts[key]
+		if user.Online {
+			report.OnlineUsers++
+		}
+		if !user.LastLoginAt.IsZero() {
+			if !user.LastLoginAt.Before(since24h) {
+				report.Logins24h++
+			}
+			if !user.LastLoginAt.Before(since7d) {
+				report.Logins7d++
+			}
+			loginByDay[user.LastLoginAt.Format("2006-01-02")]++
+		}
+		if !user.FirstSeenAt.IsZero() {
+			newByDay[user.FirstSeenAt.Format("2006-01-02")]++
+		}
+		out = append(out, user)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Online != out[j].Online {
+			return out[i].Online
+		}
+		return out[i].LastLoginAt.After(out[j].LastLoginAt)
+	})
+	report.Users = out
+	report.TotalUsers = len(out)
+	for i := 6; i >= 0; i-- {
+		day := now.AddDate(0, 0, -i).Format("2006-01-02")
+		report.Trend = append(report.Trend, models.UserTrendPoint{
+			Date:     day,
+			Logins:   loginByDay[day],
+			NewUsers: newByDay[day],
+		})
+	}
+	return report
+}
+
 // handleWindowsDownload serves the bare Windows binary, mirroring the
 // darwin/linux flow: the frontend shows a copyable PowerShell snippet that
 // downloads agent-room.exe and runs `bridge -relay <origin> -room <id>`.
@@ -513,7 +628,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, roomID string)
 		return
 	}
 
-	client := newClient(s.hub, roomID, conn, r.RemoteAddr, r.URL.Query())
+	audit := r.URL.Query().Get("audit") == "1" && s.isAdminRequest(r)
+	client := newClient(s.hub, roomID, conn, r.RemoteAddr, r.URL.Query(), audit)
 	s.hub.register(client)
 
 	go client.writeLoop()
@@ -608,6 +724,9 @@ func (h *hub) Participants(roomID string) []models.Participant {
 	clients := h.rooms[roomID]
 	groups := make(map[string]*models.Participant, len(clients))
 	for c := range clients {
+		if c.audit {
+			continue
+		}
 		p := c.participant
 		key := string(p.Kind) + ":" + p.ID
 		group := groups[key]
@@ -660,6 +779,57 @@ func (h *hub) Participants(roomID string) []models.Participant {
 		return strings.ToLower(participants[i].Label) < strings.ToLower(participants[j].Label)
 	})
 	return participants
+}
+
+func (h *hub) UserPresence() map[string]models.UserPresence {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	out := make(map[string]models.UserPresence)
+	roomSets := make(map[string]map[string]struct{})
+	for roomID, clients := range h.rooms {
+		for c := range clients {
+			if c.audit {
+				continue
+			}
+			p := c.participant
+			if p.Kind != models.SenderKindUser {
+				continue
+			}
+			login := strings.TrimSpace(p.ID)
+			if login == "" {
+				continue
+			}
+			key := strings.ToLower(login)
+			state := out[key]
+			if state.Login == "" {
+				state.Login = login
+				state.ConnectedAt = p.ConnectedAt
+			}
+			state.ConnectionCount++
+			if state.ConnectedAt.IsZero() || p.ConnectedAt.Before(state.ConnectedAt) {
+				state.ConnectedAt = p.ConnectedAt
+			}
+			if state.LastSeenAt == nil || p.LastSeenAt.After(*state.LastSeenAt) {
+				seen := p.LastSeenAt
+				state.LastSeenAt = &seen
+			}
+			if roomSets[key] == nil {
+				roomSets[key] = make(map[string]struct{})
+			}
+			roomSets[key][roomID] = struct{}{}
+			out[key] = state
+		}
+	}
+	for key, rooms := range roomSets {
+		state := out[key]
+		for roomID := range rooms {
+			state.RoomIDs = append(state.RoomIDs, roomID)
+		}
+		sort.Strings(state.RoomIDs)
+		out[key] = state
+	}
+	return out
 }
 
 func (h *hub) updateParticipant(c *client, msg models.ChatMessage) {
@@ -892,9 +1062,10 @@ type client struct {
 	conn        *websocket.Conn
 	send        chan outgoing
 	participant models.Participant
+	audit       bool
 }
 
-func newClient(hub *hub, roomID string, conn *websocket.Conn, remoteAddr string, query map[string][]string) *client {
+func newClient(hub *hub, roomID string, conn *websocket.Conn, remoteAddr string, query map[string][]string, audit bool) *client {
 	now := time.Now().UTC()
 	connectionID := firstQuery(query, "client_id")
 	if connectionID == "" {
@@ -941,6 +1112,7 @@ func newClient(hub *hub, roomID string, conn *websocket.Conn, remoteAddr string,
 		roomID: roomID,
 		conn:   conn,
 		send:   make(chan outgoing, 64),
+		audit:  audit,
 		participant: models.Participant{
 			ID:              participantID,
 			RoomID:          roomID,

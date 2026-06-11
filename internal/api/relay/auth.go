@@ -19,6 +19,7 @@ import (
 	githuboauth "golang.org/x/oauth2/github"
 
 	"agent-room/internal/config"
+	"agent-room/internal/models"
 )
 
 // sessionTTL caps how long a signed session cookie is valid.
@@ -154,6 +155,12 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, http.StatusInternalServerError, "sign session failed")
 		return
 	}
+	s.recordUserActivity(r.Context(), models.UserActivity{
+		Login:     user.Login,
+		Name:      user.Name,
+		Email:     user.Email,
+		AvatarURL: user.AvatarURL,
+	}, true)
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName(),
@@ -250,6 +257,11 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, http.StatusInternalServerError, "sign session failed")
 		return
 	}
+	s.recordUserActivity(r.Context(), models.UserActivity{
+		Login: login,
+		Name:  claims.Name,
+		Email: claims.Email,
+	}, true)
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName(),
 		Value:    signed,
@@ -331,6 +343,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	s.recordUserActivity(r.Context(), userActivityFromClaims(claims), false)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"auth_enabled":  true,
@@ -342,6 +355,36 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 			"avatar_url": claims.AvatarURL,
 		},
 	})
+}
+
+func (s *Server) recordUserActivity(ctx context.Context, user models.UserActivity, incrementLogin bool) {
+	if s.rooms == nil {
+		return
+	}
+	if user.LastLoginAt.IsZero() {
+		user.LastLoginAt = time.Now().UTC()
+	}
+	if user.FirstSeenAt.IsZero() {
+		user.FirstSeenAt = user.LastLoginAt
+	}
+	if err := s.rooms.RecordUserActivity(ctx, user, incrementLogin); err != nil {
+		s.logger.Warn("record user activity failed", slog.String("login", user.Login), slog.Any("error", err))
+	}
+}
+
+func userActivityFromClaims(claims *sessionClaims) models.UserActivity {
+	if claims == nil {
+		return models.UserActivity{}
+	}
+	now := time.Now().UTC()
+	return models.UserActivity{
+		Login:       claims.Subject,
+		Name:        claims.Name,
+		Email:       claims.Email,
+		AvatarURL:   claims.AvatarURL,
+		FirstSeenAt: now,
+		LastLoginAt: now,
+	}
 }
 
 // isAdminRequest reports whether the request carries a valid session whose

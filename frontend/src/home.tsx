@@ -3,7 +3,7 @@ import { Icon } from "./icons";
 import { Avatar, SignInPill, StatusDot, TopBrand } from "./ui";
 import { shortRoomID } from "./lib";
 import { useAuth } from "./auth";
-import type { Room } from "./types";
+import type { AdminUser, AdminUsersReport, Room } from "./types";
 
 interface RoomRecord {
   room: string;
@@ -19,7 +19,7 @@ interface HomePageProps {
   onOpenRooms: () => void;
   onOpenAdmin: () => void;
   onCreateRoom: () => void;
-  onEnterRoom: (room?: string) => void;
+  onEnterRoom: (room?: string, audit?: boolean) => void;
   onRoomDraftChange: (value: string) => void;
   onShowToast: (message: string) => void;
 }
@@ -107,7 +107,7 @@ export function HomePage({
               <StatusDot tone="live" pulse /> live agent workspace
             </span>
             <h1>
-              开个房间，<br />让异处的AI Agent自己协作～
+              开个房间，<br />让异处的 AI Agent<br />自己协作～
             </h1>
             <p>
               Agent Room 把隔离运行的 Claude CLI、执行器和操作者拉进同一个实时房间。
@@ -485,26 +485,31 @@ export function UserMenu({
 
 interface AdminPageProps {
   rooms: Room[] | null;
+  users: AdminUsersReport | null;
   hasMore: boolean;
   loadingMore: boolean;
   onLoadMore: () => void;
-  onEnterRoom: (room?: string) => void;
+  onEnterRoom: (room?: string, audit?: boolean) => void;
   onRefresh: () => void;
+  onRefreshUsers: () => void;
   onOpenHome: () => void;
   onOpenRooms: () => void;
 }
 
 export function AdminPage({
   rooms,
+  users,
   hasMore,
   loadingMore,
   onLoadMore,
   onEnterRoom,
   onRefresh,
+  onRefreshUsers,
   onOpenHome,
   onOpenRooms,
 }: AdminPageProps) {
   const { me, signOut } = useAuth();
+  const [panel, setPanel] = useState<"rooms" | "users">("users");
   // Infinite scroll: when the sentinel under the list scrolls into view,
   // fetch the next page. onLoadMore self-guards against overlapping calls.
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -543,73 +548,227 @@ export function AdminPage({
           <span className="kicker">
             <Icon name="shieldCheck" size={14} /> 管理后台
           </span>
-          <h1>所有房间</h1>
+          <h1>管理员看板</h1>
           <p>
-            作为管理员，你能看到全站每一间房间并直接进入。进入后你对房间设置（标题、访客审批、结束、销毁）拥有与房主相同的权限。
+            作为管理员，你能看到全站房间与用户动态：谁最近登录、谁还在线，以及用户增长趋势。
           </p>
         </div>
 
-        <section className="home-rooms" aria-label="All rooms">
-          <div className="home-rooms-head">
-            <span>全部房间</span>
-            <span className="count">{rooms ? `${rooms.length}${hasMore ? "+" : ""}` : "…"}</span>
-            <button
-              type="button"
-              className="icon-btn icon-btn-ghost"
-              onClick={onRefresh}
-              title="刷新"
-              aria-label="刷新"
-              style={{ marginLeft: "auto" }}
-            >
-              <Icon name="refresh" size={15} />
-            </button>
-          </div>
-          {rooms === null ? (
-            <p className="home-fine">正在加载房间列表…</p>
-          ) : rooms.length === 0 ? (
-            <p className="home-fine">还没有任何房间。</p>
-          ) : (
-            <>
-              <ul>
-                {rooms.map((room) => (
-                  <li key={room.room_id}>
-                    <button
-                      className="room-link"
-                      type="button"
-                      onClick={() => onEnterRoom(room.room_id)}
-                      title={room.room_id}
-                    >
-                      <span className="room-hash">
-                        <Icon name="hash" size={14} />
-                      </span>
-                      <span className="room-link-text">
-                        <strong>{room.title || shortRoomID(room.room_id)}</strong>
-                        <span>{adminRoomMeta(room)}</span>
-                      </span>
-                      <Icon name="chevronRight" size={15} />
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              {hasMore ? (
-                <div ref={sentinelRef} className="home-rooms-more">
-                  {loadingMore ? (
-                    <span className="home-fine">正在加载更多…</span>
-                  ) : (
-                    <button type="button" className="btn" onClick={onLoadMore}>
-                      加载更多
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <p className="home-fine home-rooms-more">已加载全部 {rooms.length} 间房间</p>
-              )}
-            </>
-          )}
-        </section>
+        <div className="admin-tabs" role="tablist" aria-label="Admin sections">
+          <button
+            type="button"
+            className={panel === "users" ? "on" : ""}
+            onClick={() => setPanel("users")}
+            role="tab"
+            aria-selected={panel === "users"}
+          >
+            <Icon name="users" size={15} /> 用户
+          </button>
+          <button
+            type="button"
+            className={panel === "rooms" ? "on" : ""}
+            onClick={() => setPanel("rooms")}
+            role="tab"
+            aria-selected={panel === "rooms"}
+          >
+            <Icon name="hash" size={15} /> 房间
+          </button>
+        </div>
+
+        {panel === "users" ? (
+          <AdminUsersPanel report={users} onRefresh={onRefreshUsers} />
+        ) : (
+          <section className="home-rooms" aria-label="All rooms">
+            <div className="home-rooms-head">
+              <span>全部房间</span>
+              <span className="count">
+                {rooms ? `${rooms.length}${hasMore ? "+" : ""}` : "…"}
+              </span>
+              <button
+                type="button"
+                className="icon-btn icon-btn-ghost"
+                onClick={onRefresh}
+                title="刷新"
+                aria-label="刷新"
+                style={{ marginLeft: "auto" }}
+              >
+                <Icon name="refresh" size={15} />
+              </button>
+            </div>
+            {rooms === null ? (
+              <p className="home-fine">正在加载房间列表…</p>
+            ) : rooms.length === 0 ? (
+              <p className="home-fine">还没有任何房间。</p>
+            ) : (
+              <>
+                <ul>
+                  {rooms.map((room) => (
+                    <li key={room.room_id}>
+	                      <button
+	                        className="room-link"
+	                        type="button"
+	                        onClick={() => onEnterRoom(room.room_id, true)}
+	                        title={room.room_id}
+	                      >
+                        <span className="room-hash">
+                          <Icon name="hash" size={14} />
+                        </span>
+                        <span className="room-link-text">
+                          <strong>{room.title || shortRoomID(room.room_id)}</strong>
+                          <span>{adminRoomMeta(room)}</span>
+                        </span>
+                        <Icon name="chevronRight" size={15} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                {hasMore ? (
+                  <div ref={sentinelRef} className="home-rooms-more">
+                    {loadingMore ? (
+                      <span className="home-fine">正在加载更多…</span>
+                    ) : (
+                      <button type="button" className="btn" onClick={onLoadMore}>
+                        加载更多
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <p className="home-fine home-rooms-more">已加载全部 {rooms.length} 间房间</p>
+                )}
+              </>
+            )}
+          </section>
+        )}
       </main>
     </div>
   );
+}
+
+function AdminUsersPanel({
+  report,
+  onRefresh,
+}: {
+  report: AdminUsersReport | null;
+  onRefresh: () => void;
+}) {
+  const maxTrend = Math.max(
+    1,
+    ...(report?.trend ?? []).map((point) => Math.max(point.logins, point.new_users)),
+  );
+  return (
+    <section className="admin-users" aria-label="Users">
+      <div className="home-rooms-head">
+        <span>用户看板</span>
+        <span className="count">{report ? `${report.total_users}` : "…"}</span>
+        <button
+          type="button"
+          className="icon-btn icon-btn-ghost"
+          onClick={onRefresh}
+          title="刷新"
+          aria-label="刷新"
+          style={{ marginLeft: "auto" }}
+        >
+          <Icon name="refresh" size={15} />
+        </button>
+      </div>
+      {report === null ? (
+        <p className="home-fine admin-pad">正在加载用户数据…</p>
+      ) : (
+        <>
+          <div className="admin-stat-grid">
+            <AdminStat label="总用户" value={report.total_users} />
+            <AdminStat label="当前在线" value={report.online_users} />
+            <AdminStat label="24h 登录" value={report.logins_24h} />
+            <AdminStat label="7d 登录" value={report.logins_7d} />
+          </div>
+          <div className="admin-trend" aria-label="7 day user trend">
+            {report.trend.map((point) => (
+              <div
+                className="admin-trend-day"
+                key={point.date}
+                title={`${point.date} 登录 ${point.logins} · 新用户 ${point.new_users}`}
+              >
+                <span
+                  className="admin-bar admin-bar-login"
+                  style={{ height: `${Math.max(6, (point.logins / maxTrend) * 72)}px` }}
+                />
+                <span
+                  className="admin-bar admin-bar-new"
+                  style={{ height: `${Math.max(6, (point.new_users / maxTrend) * 72)}px` }}
+                />
+                <small>{formatTrendDay(point.date)}</small>
+              </div>
+            ))}
+          </div>
+          {report.users.length === 0 ? (
+            <p className="home-fine admin-pad">还没有记录到登录用户。</p>
+          ) : (
+            <ul className="admin-user-list">
+              {report.users.map((user) => (
+                <AdminUserRow key={user.login} user={user} />
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function AdminStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="admin-stat">
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function AdminUserRow({ user }: { user: AdminUser }) {
+  const roomText =
+    user.online_room_ids && user.online_room_ids.length > 0
+      ? `在线房间 ${user.online_room_ids.map(shortRoomID).join(", ")}`
+      : "未连接房间";
+  return (
+    <li className="admin-user-row">
+      <Avatar
+        person={{
+          id: user.login,
+          label: user.name || user.login,
+          kind: "user",
+          avatar_url: user.avatar_url,
+        }}
+        size={34}
+        dark
+      />
+      <div className="admin-user-main">
+        <div className="admin-user-title">
+          <strong>@{user.login}</strong>
+          <span className={user.online ? "admin-online on" : "admin-online"}>
+            {user.online ? `在线 ${user.connection_count}` : "离线"}
+          </span>
+        </div>
+        <span>{user.name || user.email || "未设置显示名"}</span>
+      </div>
+      <div className="admin-user-meta">
+        <span>
+          <Icon name="clock" size={13} /> 上次登录 {formatRecordTime(user.last_login_at)}
+        </span>
+        <span>
+          <Icon name="hash" size={13} /> 创建 {user.rooms_created} 间 · 登录 {user.login_count} 次
+        </span>
+        <span>
+          <Icon name="activity" size={13} /> {roomText}
+        </span>
+      </div>
+    </li>
+  );
+}
+
+function formatTrendDay(value: string): string {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value.slice(5);
+  return date.toLocaleDateString([], { month: "numeric", day: "numeric" });
 }
 
 function adminRoomMeta(room: Room): string {

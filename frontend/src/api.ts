@@ -1,6 +1,7 @@
 import type {
   AccessPersistence,
   AccessRequest,
+  AdminUsersReport,
   AttachmentUpload,
   ChatMessage,
   Me,
@@ -56,6 +57,14 @@ export async function listAllRooms(offset = 0, limit = 50): Promise<Room[]> {
     return await getJSON<Room[]>(`/v1/admin/rooms?limit=${limit}&offset=${offset}`);
   } catch {
     return [];
+  }
+}
+
+export async function loadAdminUsers(): Promise<AdminUsersReport | null> {
+  try {
+    return await getJSON<AdminUsersReport>("/v1/admin/users");
+  } catch {
+    return null;
   }
 }
 

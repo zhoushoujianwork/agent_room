@@ -84,6 +84,38 @@ export interface Room {
   created_at: string;
 }
 
+/* ── Admin users ─────────────────────────────────────────────────── */
+
+export interface AdminUser {
+  login: string;
+  name?: string;
+  email?: string;
+  avatar_url?: string;
+  first_seen_at: string;
+  last_login_at: string;
+  login_count: number;
+  rooms_created: number;
+  online: boolean;
+  connection_count: number;
+  online_room_ids?: string[];
+  last_seen_at?: string | null;
+}
+
+export interface UserTrendPoint {
+  date: string;
+  logins: number;
+  new_users: number;
+}
+
+export interface AdminUsersReport {
+  users: AdminUser[];
+  total_users: number;
+  online_users: number;
+  logins_24h: number;
+  logins_7d: number;
+  trend: UserTrendPoint[];
+}
+
 /* ── Room summary (LLM 滚动摘要) ─────────────────────────────────── */
 
 export interface RoomSummary {

@@ -52,6 +52,7 @@ export interface WSIdentity {
   principalLabel: string;
   principalEmail?: string;
   principalName?: string;
+  audit?: boolean;
 }
 
 export function wsURL(room: string, identity: WSIdentity): string {
@@ -64,6 +65,7 @@ export function wsURL(room: string, identity: WSIdentity): string {
   });
   if (identity.principalEmail) params.set("principal_email", identity.principalEmail);
   if (identity.principalName) params.set("principal_name", identity.principalName);
+  if (identity.audit) params.set("audit", "1");
   return `${wsBaseURL(room)}?${params.toString()}`;
 }
 

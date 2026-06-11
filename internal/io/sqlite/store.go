@@ -71,6 +71,16 @@ func migrate(db *sql.DB) error {
             covered_seq INTEGER NOT NULL DEFAULT 0,
             updated_at  TEXT NOT NULL
         );`,
+		`CREATE TABLE IF NOT EXISTS user_activity (
+            login         TEXT PRIMARY KEY,
+            name          TEXT NOT NULL DEFAULT '',
+            email         TEXT NOT NULL DEFAULT '',
+            avatar_url    TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL,
+            last_login_at TEXT NOT NULL,
+            login_count   INTEGER NOT NULL DEFAULT 0
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_user_activity_last_login ON user_activity(last_login_at);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

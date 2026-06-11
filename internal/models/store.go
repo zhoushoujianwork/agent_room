@@ -67,6 +67,8 @@ type RoomStore interface {
 	// and capped at limit (0 = no cap). Used by the admin "all rooms" view
 	// for pagination; ordinary callers fetch by id.
 	ListRooms(ctx context.Context, limit, offset int) ([]Room, error)
+	RecordUserActivity(ctx context.Context, user UserActivity, incrementLogin bool) error
+	ListUserActivities(ctx context.Context) ([]UserActivity, error)
 
 	CreateAccessRequest(ctx context.Context, req AccessRequest) error
 	GetAccessRequest(ctx context.Context, requestID string) (*AccessRequest, error)

@@ -210,6 +210,43 @@ func TestParticipantsAggregatesUserConnections(t *testing.T) {
 	}
 }
 
+func TestAuditConnectionsAreHiddenFromParticipantsAndPresence(t *testing.T) {
+	h := newHub(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Now().UTC()
+
+	auditAdmin := &client{roomID: "demo", audit: true, participant: models.Participant{
+		ID:           "root",
+		RoomID:       "demo",
+		Kind:         models.SenderKindUser,
+		Label:        "Root",
+		ConnectionID: "admin-audit",
+		ConnectedAt:  now.Add(-1 * time.Minute),
+		LastSeenAt:   now,
+	}}
+	visibleUser := &client{roomID: "demo", participant: models.Participant{
+		ID:           "alice",
+		RoomID:       "demo",
+		Kind:         models.SenderKindUser,
+		Label:        "Alice",
+		ConnectionID: "alice-tab",
+		ConnectedAt:  now.Add(-2 * time.Minute),
+		LastSeenAt:   now,
+	}}
+	h.rooms["demo"] = map[*client]struct{}{auditAdmin: {}, visibleUser: {}}
+
+	participants := h.Participants("demo")
+	if len(participants) != 1 || participants[0].ID != "alice" {
+		t.Fatalf("participants = %#v, want only alice", participants)
+	}
+	presence := h.UserPresence()
+	if _, ok := presence["root"]; ok {
+		t.Fatalf("audit admin leaked into user presence: %#v", presence["root"])
+	}
+	if presence["alice"].ConnectionCount != 1 {
+		t.Fatalf("alice presence = %#v, want one connection", presence["alice"])
+	}
+}
+
 // TestPublishStampsExecTokenFromPresence verifies the relay-mediated model:
 // the executor reports its token via presence (recorded privately), a later
 // targeted command carries no token from the sender, yet the relay stamps the

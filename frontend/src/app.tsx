@@ -11,6 +11,7 @@ import {
 import type {
   AccessRequest,
   AccessDecisionEvent,
+  AdminUsersReport,
   ChatMessage,
   Participant,
   Room,
@@ -32,6 +33,7 @@ import {
   getRoom,
   listAccessRequests,
   listAllRooms,
+  loadAdminUsers,
   loadHistory,
   loadHistoryBefore,
   loadParticipants,
@@ -274,10 +276,12 @@ function InnerApp() {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [connected, setConnected] = useState(false);
   const [roomRecords, setRoomRecords] = useState<RoomRecord[]>(() => loadRoomRecords());
+  const [auditRoom, setAuditRoom] = useState<string | null>(null);
   // Admin "all rooms" pagination: pages of ADMIN_ROOMS_PAGE accumulate into
   // adminRooms; a short page flips adminHasMore off, adminLoadingMore guards
   // against overlapping fetches from the scroll sentinel.
   const [adminRooms, setAdminRooms] = useState<Room[] | null>(null);
+  const [adminUsers, setAdminUsers] = useState<AdminUsersReport | null>(null);
   const [adminHasMore, setAdminHasMore] = useState(false);
   const [adminLoadingMore, setAdminLoadingMore] = useState(false);
 
@@ -351,6 +355,7 @@ function InnerApp() {
         principalLabel: me.user.login,
         principalEmail: me.user.email,
         principalName: me.user.name,
+        audit: auditRoom === roomID,
       };
     }
     return {
@@ -359,7 +364,7 @@ function InnerApp() {
       principalID: viewerID,
       principalLabel: viewerID,
     };
-  }, [me, viewerID]);
+  }, [auditRoom, me, roomID, viewerID]);
 
   const admin = useMemo(() => isAdminMe(me), [me]);
   const isOwner = useMemo(() => isOwnerOf(me, room?.owner ?? null), [me, room?.owner]);
@@ -471,15 +476,19 @@ function InnerApp() {
 
   useEffect(() => {
     if (!roomID) return;
-    localStorage.setItem("agent-room.room", roomID);
+    if (auditRoom !== roomID) {
+      localStorage.setItem("agent-room.room", roomID);
+    }
     if (appView === "room") {
-      setRoomRecords((records) => upsertRoomRecord(records, roomID, room?.title ?? undefined));
+      if (auditRoom !== roomID) {
+        setRoomRecords((records) => upsertRoomRecord(records, roomID, room?.title ?? undefined));
+      }
       const desired = roomPath(roomID, tab);
       if (`${window.location.pathname}${window.location.search}` !== desired) {
         window.history.replaceState(null, "", desired);
       }
     }
-  }, [appView, roomID, room?.title, tab]);
+  }, [appView, auditRoom, roomID, room?.title, tab]);
 
   /* ── WebSocket ────────────────────────────────────────────────── */
   useEffect(() => {
@@ -1058,7 +1067,7 @@ function InnerApp() {
 
   /* ── Room actions ──────────────────────────────────────────────── */
 
-  function enterRoom(value?: string) {
+  function enterRoom(value?: string, audit = false) {
     const nextRoom = roomFromInput(value ?? roomDraft);
     if (!nextRoom) {
       showToast("Paste a room ID or link");
@@ -1067,6 +1076,7 @@ function InnerApp() {
     const nextURL = roomPath(nextRoom);
     if (!requireSignedIdentity(nextURL)) return;
     setRoomID(nextRoom);
+    setAuditRoom(audit && admin ? nextRoom : null);
     setAppView("room");
     setRoomDraft("");
     setTab("chat");
@@ -1089,6 +1099,7 @@ function InnerApp() {
       const nextID = cleanRoom(next.room_id);
       setRoom(next);
       setRoomID(nextID);
+      setAuditRoom(null);
       setAppView("room");
       setTab("chat");
       setMessages([]);
@@ -1108,6 +1119,7 @@ function InnerApp() {
 
   function goHome() {
     setAppView("home");
+    setAuditRoom(null);
     setRoomID("");
     setMessages([]);
     setParticipants([]);
@@ -1118,6 +1130,7 @@ function InnerApp() {
   function openRooms() {
     if (!requireSignedIdentity("/rooms")) return;
     setAppView("rooms");
+    setAuditRoom(null);
     setRoomID("");
     setMessages([]);
     setParticipants([]);
@@ -1130,6 +1143,10 @@ function InnerApp() {
       setAdminRooms(page);
       setAdminHasMore(page.length === ADMIN_ROOMS_PAGE);
     });
+  }, []);
+
+  const refreshAdminUsers = useCallback(() => {
+    loadAdminUsers().then(setAdminUsers);
   }, []);
 
   const loadMoreAdminRooms = useCallback(() => {
@@ -1152,6 +1169,7 @@ function InnerApp() {
   function openAdmin() {
     if (!admin) return;
     setAdminRooms(null);
+    setAdminUsers(null);
     setAdminHasMore(false);
     setAppView("admin");
     if (window.location.pathname !== "/admin") {
@@ -1170,7 +1188,8 @@ function InnerApp() {
       return;
     }
     if (adminRooms === null) refreshAdminRooms();
-  }, [appView, authLoading, admin, adminRooms, refreshAdminRooms]);
+    if (adminUsers === null) refreshAdminUsers();
+  }, [appView, authLoading, admin, adminRooms, adminUsers, refreshAdminRooms, refreshAdminUsers]);
 
   const roomURL = useMemo(
     () => (roomID ? `${window.location.origin}${roomPath(roomID)}` : ""),
@@ -1314,11 +1333,13 @@ function InnerApp() {
       <>
         <AdminPage
           rooms={adminRooms}
+          users={adminUsers}
           hasMore={adminHasMore}
           loadingMore={adminLoadingMore}
           onLoadMore={loadMoreAdminRooms}
           onEnterRoom={enterRoom}
           onRefresh={refreshAdminRooms}
+          onRefreshUsers={refreshAdminUsers}
           onOpenHome={goHome}
           onOpenRooms={openRooms}
         />
