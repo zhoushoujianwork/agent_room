@@ -150,6 +150,16 @@ export interface CreatedAgentToken {
   created_at: string;
 }
 
+// AgentConfig 是 GET/PUT /v1/agents/{id}/config 的响应，与 Go 侧
+// agentConfigResponse 对偶；api_key 永远只有脱敏形式。
+export interface AgentConfig {
+  model: string;
+  api_base_url: string;
+  api_key_masked: string;
+  updated_at?: string;
+  updated_by?: string;
+}
+
 /* ── Room summary (LLM 滚动摘要) ─────────────────────────────────── */
 
 export interface RoomSummary {
