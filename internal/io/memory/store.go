@@ -33,8 +33,9 @@ type Store struct {
 	// agents / agentTokens mirror the SQLite agent-binding tables. Created
 	// lazily (see ensureAgentMaps) so this optional feature stays out of the
 	// hot NewStore path.
-	agents      map[string]models.Agent
-	agentTokens map[string]models.AgentToken
+	agents       map[string]models.Agent
+	agentTokens  map[string]models.AgentToken
+	agentConfigs map[string]models.AgentConfig
 }
 
 func NewStore() *Store {

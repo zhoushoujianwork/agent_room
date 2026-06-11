@@ -60,7 +60,7 @@ func TestCompleteInterruptReturnsSentinel(t *testing.T) {
 		t.Fatalf("write stub: %v", err)
 	}
 
-	p := NewClaudeProvider(script, "", 0, 1, false, false, false)
+	p := NewClaudeProvider(script, "", "", "", "", 0, 1, false, false, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -90,7 +90,7 @@ func TestCompleteIdleTimeoutFires(t *testing.T) {
 		t.Fatalf("write stub: %v", err)
 	}
 
-	p := NewClaudeProvider(script, "", 100*time.Millisecond, 1, false, false, false)
+	p := NewClaudeProvider(script, "", "", "", "", 100*time.Millisecond, 1, false, false, false)
 
 	_, err := p.Complete(context.Background(), models.ProviderRequest{
 		RoomID:  "demo",

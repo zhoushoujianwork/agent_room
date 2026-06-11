@@ -27,6 +27,14 @@ const (
 	// (值为 allow_once|allow_always|deny)。由 bridge readLoop 按 permission_id
 	// 路由到等待中的 RequestPermission 闭包。
 	ControlOperationPermissionReply = "permission_reply"
+	// ControlOperationConfigUpdate pushes server-managed startup config
+	// (model / api_base_url / api_key) to a single targeted agent. It is
+	// delivered ONLY over that agent's own connection (never broadcast, never
+	// persisted to room history) and carries the api key in plaintext on that
+	// targeted channel — handlers must redact metadata["api_key"] before any
+	// logging. The bridge applies it to its provider's in-memory runtime
+	// config; an empty field means "fall back to the bridge local default".
+	ControlOperationConfigUpdate = "config_update"
 )
 
 type SenderKind string

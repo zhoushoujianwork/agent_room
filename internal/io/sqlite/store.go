@@ -100,6 +100,14 @@ func migrate(db *sql.DB) error {
             revoked      INTEGER NOT NULL DEFAULT 0
         );`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_tokens_owner ON agent_tokens(owner_login);`,
+		`CREATE TABLE IF NOT EXISTS agent_configs (
+            agent_id       TEXT PRIMARY KEY REFERENCES agents(agent_id),
+            model          TEXT NOT NULL DEFAULT '',
+            api_base_url   TEXT NOT NULL DEFAULT '',
+            api_key_cipher TEXT NOT NULL DEFAULT '',
+            updated_at     TEXT NOT NULL,
+            updated_by     TEXT NOT NULL DEFAULT ''
+        );`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

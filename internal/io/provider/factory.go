@@ -15,6 +15,9 @@ func New(cfg config.Config) (models.AgentProvider, error) {
 		return cliprovider.NewClaudeProvider(
 			cfg.Claude.Command,
 			cfg.Claude.WorkingDir,
+			cfg.Claude.Model,
+			cfg.Claude.APIBaseURL,
+			cfg.Claude.APIKey,
 			cfg.Claude.Timeout,
 			cfg.Claude.MaxTurns,
 			cfg.Claude.DisableTools,

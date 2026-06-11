@@ -199,6 +199,7 @@ manage join requests on gated rooms via `/v1/rooms/:id/access-requests`.
 | `GITHUB_OAUTH_REDIRECT_URI`  | optional     | derived from request | full URL incl. `/auth/github/callback` |
 | `AGENT_ROOM_SESSION_SECRET`  | when auth on | empty | 32+ random bytes; signs session cookies |
 | `AGENT_ROOM_COOKIE_NAME`     | optional     | `agent_room_session` | |
+| `AGENT_ROOM_SECRET_KEY`      | for agent api keys | empty | relay-side secret; AES-256-GCM encrypts per-agent API keys at rest. Empty = `model`/`api_base_url` still configurable, but saving an `api_key` is rejected. |
 
 When **any** of client id / client secret / session secret is missing, all
 auth-related routes return 404 and the relay falls back to anonymous local
@@ -234,6 +235,36 @@ Useful flags:
 - `-claude-timeout`: limit one invocation.
 - `-claude-disable-tools`: default `false`; when true, passes `--tools ""`.
 - `-claude-no-session-persistence`: default `true`, avoids saving room messages into local Claude history.
+
+Bridge-local defaults for model and API routing (server-pushed config overrides these per agent — see below):
+
+- `AGENT_ROOM_CLAUDE_MODEL`: passed as `--model <value>` when non-empty.
+- `AGENT_ROOM_CLAUDE_API_BASE_URL`: injected as `ANTHROPIC_BASE_URL` into the `claude -p` child env.
+- `AGENT_ROOM_CLAUDE_API_KEY`: injected as `ANTHROPIC_AUTH_TOKEN` (Bearer auth; works for the official API and third-party Anthropic-compatible gateways).
+
+### Server-managed agent config
+
+An owner (or admin) can centrally set the `model`, `api_base_url`, and `api_key`
+for one of their bound agents — no need to edit the bridge host. Config is stored
+on the relay (SQLite); the API key is encrypted at rest with AES-256-GCM keyed by
+`AGENT_ROOM_SECRET_KEY` and is **never** returned in plaintext (GET shows a masked
+form like `sk-***abcd`).
+
+- `GET /v1/agents/{agent_id}/config` → `{model, api_base_url, api_key_masked, updated_at}`.
+- `PUT /v1/agents/{agent_id}/config` → body `{model?, api_base_url?, api_key?}`.
+  Omit a field to keep it; send `""` to clear it; send a non-empty `api_key` to set it.
+
+Both require a signed-in session and `owner_login == you` (or admin); other users
+get 403, and an unbound/unknown agent is 404. Saving an `api_key` without
+`AGENT_ROOM_SECRET_KEY` set returns 400 (model/base_url still save).
+
+The relay pushes the config to the target agent over a private `config_update`
+control message (the only place the key travels in plaintext) when the agent comes
+online and whenever it changes. This message is delivered solely on that agent's
+own connection — never broadcast to the room, never written to message history.
+The bridge applies it to the provider's in-memory runtime config, so it takes
+effect on the next reply with no restart. A non-empty server value wins over the
+bridge-local default; an empty one falls back to it.
 
 ## Executor Bridge
 
