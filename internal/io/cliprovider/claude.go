@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,18 +30,34 @@ type ClaudeProvider struct {
 	disableTools         bool
 	noSessionPersistence bool
 	skipPermissions      bool
+	// localModel / localAPIBaseURL / localAPIKey are the bridge-host defaults
+	// (from AGENT_ROOM_CLAUDE_MODEL / _API_BASE_URL / _API_KEY). They are
+	// immutable after construction.
+	localModel      string
+	localAPIBaseURL string
+	localAPIKey     string
+	// runtimeMu guards the relay-pushed overrides below, which a config_update
+	// control message replaces wholesale at runtime. A non-empty override wins
+	// over the matching local default; an empty override falls back to it.
+	runtimeMu     sync.RWMutex
+	srvModel      string
+	srvAPIBaseURL string
+	srvAPIKey     string
 	// alwaysRules 是链路 B allow_always 决策的进程级记忆, 跨 Complete 共享给每次
 	// 新建的 hook broker, 让"总是批准"在后续回复里持续生效(见 claude_permission.go)。
 	alwaysRules *hookAlwaysRules
 }
 
-func NewClaudeProvider(command, workingDir string, timeout time.Duration, maxTurns int, disableTools bool, noSessionPersistence bool, skipPermissions bool) *ClaudeProvider {
+func NewClaudeProvider(command, workingDir, model, apiBaseURL, apiKey string, timeout time.Duration, maxTurns int, disableTools bool, noSessionPersistence bool, skipPermissions bool) *ClaudeProvider {
 	if maxTurns <= 0 {
 		maxTurns = 1
 	}
 	return &ClaudeProvider{
 		command:              command,
 		workingDir:           workingDir,
+		localModel:           model,
+		localAPIBaseURL:      apiBaseURL,
+		localAPIKey:          apiKey,
 		timeout:              timeout,
 		maxTurns:             maxTurns,
 		disableTools:         disableTools,
@@ -48,6 +65,39 @@ func NewClaudeProvider(command, workingDir string, timeout time.Duration, maxTur
 		skipPermissions:      skipPermissions,
 		alwaysRules:          newHookAlwaysRules(),
 	}
+}
+
+// ApplyServerConfig replaces the relay-pushed runtime overrides. Called by the
+// bridge when a config_update control message arrives. Values are stored in
+// memory only (never persisted) and take effect on the next Complete, since
+// each reply spawns a fresh `claude -p`. An empty field means "use the bridge
+// local default for this field".
+func (p *ClaudeProvider) ApplyServerConfig(model, apiBaseURL, apiKey string) {
+	p.runtimeMu.Lock()
+	defer p.runtimeMu.Unlock()
+	p.srvModel = model
+	p.srvAPIBaseURL = apiBaseURL
+	p.srvAPIKey = apiKey
+}
+
+// effectiveConfig resolves the model / base url / api key to use for this run:
+// the relay override when non-empty, else the bridge local default.
+func (p *ClaudeProvider) effectiveConfig() (model, apiBaseURL, apiKey string) {
+	p.runtimeMu.RLock()
+	defer p.runtimeMu.RUnlock()
+	model = firstNonEmpty(p.srvModel, p.localModel)
+	apiBaseURL = firstNonEmpty(p.srvAPIBaseURL, p.localAPIBaseURL)
+	apiKey = firstNonEmpty(p.srvAPIKey, p.localAPIKey)
+	return model, apiBaseURL, apiKey
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (p *ClaudeProvider) Name() string {
@@ -119,11 +169,20 @@ func (p *ClaudeProvider) Complete(ctx context.Context, req models.ProviderReques
 
 	prompt := buildClaudePrompt(req, delegateViaMCP)
 
+	// Resolve the per-agent runtime config (relay override > bridge default).
+	// model -> --model flag; api_base_url / api_key -> child-process env. Each
+	// reply spawns a fresh `claude -p`, so a config_update takes effect on the
+	// next generation with no bridge restart.
+	effModel, effAPIBaseURL, effAPIKey := p.effectiveConfig()
+
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
 		"--verbose",
 		"--max-turns", strconv.Itoa(maxTurns),
+	}
+	if strings.TrimSpace(effModel) != "" {
+		args = append(args, "--model", effModel)
 	}
 	if p.disableTools {
 		args = append(args, "--tools", "")
@@ -145,8 +204,25 @@ func (p *ClaudeProvider) Complete(ctx context.Context, req models.ProviderReques
 	if p.workingDir != "" {
 		cmd.Dir = p.workingDir
 	}
+	// Build env additions for session-persistence and per-agent API routing.
+	// We only override os.Environ() when we actually have something to add, to
+	// keep the default `claude -p` behavior byte-identical when no config is set.
+	var envExtra []string
 	if p.noSessionPersistence {
-		cmd.Env = append(os.Environ(), "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1")
+		envExtra = append(envExtra, "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1")
+	}
+	if strings.TrimSpace(effAPIBaseURL) != "" {
+		envExtra = append(envExtra, "ANTHROPIC_BASE_URL="+effAPIBaseURL)
+	}
+	if strings.TrimSpace(effAPIKey) != "" {
+		// ANTHROPIC_AUTH_TOKEN sets an "Authorization: Bearer" header, which is
+		// what third-party Anthropic-compatible gateways expect and what the
+		// official API also accepts. We deliberately inject only this one (not
+		// ANTHROPIC_API_KEY) to avoid the two clashing on third-party endpoints.
+		envExtra = append(envExtra, "ANTHROPIC_AUTH_TOKEN="+effAPIKey)
+	}
+	if len(envExtra) > 0 {
+		cmd.Env = append(os.Environ(), envExtra...)
 	}
 
 	stdout, err := cmd.StdoutPipe()

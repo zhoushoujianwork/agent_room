@@ -36,13 +36,17 @@ type Config struct {
 	// listing every room and managing/entering any of them as if they owned
 	// it. Loaded from AGENT_ROOM_ADMINS (comma or space separated) and
 	// overridable via the relay -admins flag. Empty = no admins.
-	Admins   []string
-	Claude   ClaudeConfig
-	OpenCode OpenCodeConfig
-	Exec     ExecConfig
-	GitHub   GitHubConfig
-	BuildHub BuildHubConfig
-	LLM      LLMConfig
+	Admins []string
+	// SecretKey (relay side) is the AGENT_ROOM_SECRET_KEY used to AES-256-GCM
+	// encrypt per-agent api keys at rest. Empty disables api_key persistence
+	// (model / api_base_url are unaffected).
+	SecretKey string
+	Claude    ClaudeConfig
+	OpenCode  OpenCodeConfig
+	Exec      ExecConfig
+	GitHub    GitHubConfig
+	BuildHub  BuildHubConfig
+	LLM       LLMConfig
 }
 
 // IsAdmin reports whether the given session login has cross-room admin
@@ -126,8 +130,16 @@ func (l LLMConfig) Enabled() bool {
 }
 
 type ClaudeConfig struct {
-	Command              string
-	WorkingDir           string
+	Command    string
+	WorkingDir string
+	// Model / APIBaseURL / APIKey are bridge-local defaults for the agent's
+	// `claude -p` invocation (AGENT_ROOM_CLAUDE_MODEL / _API_BASE_URL /
+	// _API_KEY). The relay can override any of them at runtime via a
+	// config_update control message; a non-empty server value wins, an empty
+	// server value falls back to these local defaults.
+	Model                string
+	APIBaseURL           string
+	APIKey               string
 	Timeout              time.Duration // 流式空闲超时:距上次输出超过此时长才判定卡死
 	MaxTurns             int
 	DisableTools         bool
@@ -174,9 +186,13 @@ func Load() Config {
 		BackfillLimit: envInt("AGENT_ROOM_BACKFILL_LIMIT", 100),
 		TurnBudget:    envInt("AGENT_ROOM_TURN_BUDGET", 1),
 		Admins:        SplitList(os.Getenv("AGENT_ROOM_ADMINS")),
+		SecretKey:     envString("AGENT_ROOM_SECRET_KEY", ""),
 		Claude: ClaudeConfig{
 			Command:    envString("AGENT_ROOM_CLAUDE_COMMAND", "claude"),
 			WorkingDir: envString("AGENT_ROOM_CLAUDE_WORKDIR", ""),
+			Model:      envString("AGENT_ROOM_CLAUDE_MODEL", ""),
+			APIBaseURL: envString("AGENT_ROOM_CLAUDE_API_BASE_URL", ""),
+			APIKey:     envString("AGENT_ROOM_CLAUDE_API_KEY", ""),
 			Timeout:    envDuration("AGENT_ROOM_CLAUDE_TIMEOUT", 10*time.Minute),
 			// 默认 100:executor 委派 + 长采样排查(发命令 → sleep 采样 → 再采样
 			// → 聚合分析)一轮就能吃掉十几到几十个回合,24 仍会在写出最终结论前被

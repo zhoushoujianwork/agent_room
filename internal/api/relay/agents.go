@@ -33,6 +33,9 @@ type AgentStore interface {
 	TouchAgentTokenLastUsed(ctx context.Context, hash string, t time.Time) error
 	ListAgentTokensByOwner(ctx context.Context, owner string) ([]models.AgentToken, error)
 	RevokeAgentTokenByPrefix(ctx context.Context, owner, prefix string) (int, error)
+
+	GetAgentConfig(ctx context.Context, agentID string) (*models.AgentConfig, error)
+	UpsertAgentConfig(ctx context.Context, cfg models.AgentConfig) error
 }
 
 // agentTokenBytes is the random-token size in bytes before base64url encoding.
@@ -132,8 +135,22 @@ func (s *Server) handleAgentItem(w http.ResponseWriter, r *http.Request) {
 	if login == "" {
 		return
 	}
-	agentID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/agents/"), "/")
-	if agentID == "" || strings.Contains(agentID, "/") {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/agents/"), "/")
+	if rest == "" {
+		writeError(w, http.StatusNotFound, "unknown route")
+		return
+	}
+	// /v1/agents/{agent_id}/config is the per-agent startup config endpoint.
+	if agentID, ok := strings.CutSuffix(rest, "/config"); ok {
+		if agentID == "" || strings.Contains(agentID, "/") {
+			writeError(w, http.StatusNotFound, "unknown route")
+			return
+		}
+		s.handleAgentConfig(w, r, agentID)
+		return
+	}
+	agentID := rest
+	if strings.Contains(agentID, "/") {
 		writeError(w, http.StatusNotFound, "unknown route")
 		return
 	}

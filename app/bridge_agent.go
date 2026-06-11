@@ -335,7 +335,16 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 			}
 			return err
 		}
-		if _, err := e.chat.Add(ctx, msg.RoomID, msg); err != nil {
+		// A config_update carries a plaintext api_key on this targeted channel.
+		// Keep it out of the (in-memory) local store: strip it from the stored
+		// copy so it can never surface in local history dumps or logging.
+		stored := msg
+		if msg.Type == models.MessageTypeControl &&
+			strings.TrimSpace(msg.Metadata["operation"]) == models.ControlOperationConfigUpdate &&
+			strings.TrimSpace(msg.Metadata["api_key"]) != "" {
+			stored.Metadata = copyMetadataWithout(msg.Metadata, "api_key")
+		}
+		if _, err := e.chat.Add(ctx, stored.RoomID, stored); err != nil {
 			a.logger.Warn("store incoming message failed", slog.Any("error", err))
 		}
 
@@ -344,6 +353,8 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 		// decision back to a blocked RequestPermission closure.
 		if msg.Type == models.MessageTypeControl && msg.IsAddressedTo(a.cfg.AgentID) {
 			switch strings.TrimSpace(msg.Metadata["operation"]) {
+			case models.ControlOperationConfigUpdate:
+				e.applyConfigUpdate(msg)
 			case models.ControlOperationPermissionReply:
 				permID := strings.TrimSpace(msg.Metadata["permission_id"])
 				reply := models.PermissionReply(strings.TrimSpace(msg.Metadata["reply"]))
@@ -406,6 +417,49 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 				slog.String("room_id", msg.RoomID), slog.String("from", msg.SenderID))
 		}
 	}
+}
+
+// runtimeConfigurable is implemented by providers that accept a server-pushed
+// startup config (model / api base url / api key) at runtime. Only the Claude
+// provider needs it today; others simply don't implement it and config_update
+// becomes a no-op for them.
+type runtimeConfigurable interface {
+	ApplyServerConfig(model, apiBaseURL, apiKey string)
+}
+
+// applyConfigUpdate applies a relay config_update control message to the local
+// provider's in-memory runtime config. The new values take effect on the next
+// reply (each spawns a fresh `claude -p`); nothing is persisted to disk and the
+// api key is never logged.
+func (e *agentEngine) applyConfigUpdate(msg models.ChatMessage) {
+	configurable, ok := e.provider.(runtimeConfigurable)
+	if !ok {
+		e.app.logger.Warn("config_update ignored: provider not runtime-configurable",
+			slog.String("provider", e.provider.Name()))
+		return
+	}
+	model := strings.TrimSpace(msg.Metadata["model"])
+	apiBaseURL := strings.TrimSpace(msg.Metadata["api_base_url"])
+	apiKey := msg.Metadata["api_key"] // may be empty; never logged
+	configurable.ApplyServerConfig(model, apiBaseURL, apiKey)
+	e.app.logger.Info("agent config updated from relay",
+		slog.String("room_id", msg.RoomID),
+		slog.String("model", model),
+		slog.String("api_base_url", apiBaseURL),
+		slog.Bool("api_key_set", strings.TrimSpace(apiKey) != ""))
+}
+
+// copyMetadataWithout returns a shallow copy of metadata with the named key
+// removed. Used to strip a plaintext secret before storing a message.
+func copyMetadataWithout(metadata map[string]string, drop string) map[string]string {
+	out := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		if k == drop {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // worker runs queued replies one at a time, for the lifetime of the engine

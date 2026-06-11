@@ -68,6 +68,7 @@ func NewServer(cfg config.Config, service *chat.Service, rooms models.RoomStore,
 	}
 	s.hub = newHub(service, logger)
 	s.hub.agents = s.agents
+	s.hub.secretKey = deriveSecretKey(cfg.SecretKey)
 	return s
 }
 
@@ -692,8 +693,13 @@ type hub struct {
 	// agents, when set, persists agent->owner bindings as agents come online.
 	// Nil when the backing store doesn't support agent ownership.
 	agents AgentStore
-	mu     sync.RWMutex
-	rooms  map[string]map[*client]struct{}
+	// secretKey is the AES-256 key (derived from AGENT_ROOM_SECRET_KEY) used to
+	// decrypt a stored agent api key before pushing it on the targeted
+	// config_update channel. Nil when no secret is configured (api keys are
+	// then never stored, so nothing to decrypt).
+	secretKey []byte
+	mu        sync.RWMutex
+	rooms     map[string]map[*client]struct{}
 	// execTokens maps roomID -> executor agent id -> exec_token. The relay is
 	// the sole keeper of these tokens: an executor reports its token in its
 	// presence message, the relay records it here (never storing or
@@ -973,7 +979,12 @@ func (h *hub) bindAgentOwner(ctx context.Context, c *client, msg models.ChatMess
 	}); err != nil {
 		h.logger.Warn("upsert agent binding failed",
 			slog.String("agent_id", agentID), slog.Any("error", err))
+		return
 	}
+	// Now that the agent is bound and online, push any server-managed config so
+	// it takes effect on the next reply. Delivered only on this connection —
+	// never broadcast, never persisted (see sendConfigUpdateToClient).
+	h.pushAgentConfig(ctx, c, agentID)
 }
 
 // ErrCommandMissingTarget is returned when a command message lacks the
