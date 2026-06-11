@@ -9,7 +9,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import type { AccessRequest, Participant, Room } from "./types";
+import type { AccessRequest, ChatMessage, Participant, Room } from "./types";
 import { Icon, OsGlyph } from "./icons";
 import { Avatar, BrandMark, Chip, ModeBadge, OsAvatar, SignInPill, StatusDot } from "./ui";
 import {
@@ -886,6 +886,9 @@ interface ComposerProps {
   mentionOptions: MentionOption[];
   attachments: PendingAttachment[];
   uploadingCount: number;
+  replyTo: ChatMessage | null;
+  replyPreview: string;
+  onCancelReply: () => void;
   onAttachFiles: (files: File[]) => void;
   onRemoveAttachment: (id: string) => void;
   onContentChange: (event: ChangeEvent<HTMLTextAreaElement>) => void;
@@ -914,6 +917,9 @@ export function Composer({
   mentionOptions,
   attachments,
   uploadingCount,
+  replyTo,
+  replyPreview,
+  onCancelReply,
   onAttachFiles,
   onRemoveAttachment,
   onContentChange,
@@ -955,7 +961,7 @@ export function Composer({
   const showStickyBar = agents.length > 0 || Boolean(stickyTarget);
   const placeholder = stickyTarget
     ? `发消息 — 默认召唤 @${stickyTarget}${stickyActive ? "" : "（已离开）"}，@其他人可临时改向`
-    : "发消息 — 用 @bridge-id 召唤 agent";
+    : "发消息 — 用 @ 提及房间成员或召唤 agent";
   return (
     <footer
       className={dragOver ? "composer composer-dragover" : "composer"}
@@ -989,6 +995,23 @@ export function Composer({
               <span className="messages-backfill-spin" />
             </span>
           )}
+        </div>
+      )}
+      {replyTo && (
+        <div className="composer-reply">
+          <div>
+            <span>回复 {replyTo.sender_id || "unknown"}</span>
+            <p>{replyPreview}</p>
+          </div>
+          <button
+            type="button"
+            className="composer-reply-close"
+            onClick={onCancelReply}
+            title="取消回复"
+            aria-label="取消回复"
+          >
+            <Icon name="x" size={14} />
+          </button>
         </div>
       )}
       {showStickyBar && (
@@ -1080,7 +1103,7 @@ export function Composer({
                 </>
               ) : (
                 <>
-                  <kbd>@</kbd> 召唤 agent · <kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行
+                  <kbd>@</kbd> 提及成员 · <kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行
                 </>
               )}
             </span>

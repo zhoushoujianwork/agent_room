@@ -207,9 +207,11 @@ interface MessageItemProps {
   message: ChatMessage;
   viewerID: string;
   dark: boolean;
+  mentioned?: boolean;
+  onReply?: (message: ChatMessage) => void;
 }
 
-export function MessageItem({ message, viewerID, dark }: MessageItemProps) {
+export function MessageItem({ message, viewerID, dark, mentioned = false, onReply }: MessageItemProps) {
   const isMine =
     message.sender_kind === "user" && (message.sender_id === viewerID || message.sender_id === "me");
   const hue = hueFromID(message.sender_id);
@@ -222,7 +224,7 @@ export function MessageItem({ message, viewerID, dark }: MessageItemProps) {
     hue,
   };
   return (
-    <div className={`bubble-row ${isMine ? "mine" : "theirs"}`}>
+    <div className={`bubble-row ${isMine ? "mine" : "theirs"}${mentioned ? " mentioned" : ""}`}>
       {!isMine && <Avatar person={person} dark={dark} size={32} />}
       <div className="bubble-col">
         <div className="bubble-meta">
@@ -244,9 +246,20 @@ export function MessageItem({ message, viewerID, dark }: MessageItemProps) {
             background: isMine ? tint.faint : "var(--surface)",
           }}
         >
+          {message.metadata?.reply_to && (
+            <div className="bubble-reply-ref">
+              <span>{message.metadata.reply_sender || "引用"}</span>
+              <p>{message.metadata.reply_preview || "原消息"}</p>
+            </div>
+          )}
           <Markdown text={message.content || ""} />
           <MessageAttachments message={message} />
         </div>
+        {onReply && (
+          <button type="button" className="bubble-reply-btn" onClick={() => onReply(message)}>
+            <Icon name="reply" size={13} /> 回复
+          </button>
+        )}
       </div>
       {isMine && <Avatar person={person} dark={dark} size={32} />}
     </div>

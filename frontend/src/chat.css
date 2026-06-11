@@ -16,6 +16,7 @@
 /* ── chat bubble ─────────────────────────────────────────────────── */
 .bubble-row { display: flex; gap: 11px; align-items: flex-start; max-width: 100%; }
 .bubble-row.mine { flex-direction: row; justify-content: flex-end; }
+.bubble-row.mentioned .bubble { box-shadow: 0 0 0 1px var(--accent-line), 0 12px 34px rgba(54, 223, 183, 0.12); }
 .bubble-col { display: flex; flex-direction: column; gap: 5px; min-width: 0; max-width: min(660px, 82%); }
 .bubble-row.mine .bubble-col { align-items: flex-end; }
 .bubble-meta { display: inline-flex; align-items: center; gap: 8px; padding: 0 2px; flex-wrap: wrap; }
@@ -26,6 +27,16 @@
 .bubble { padding: 11px 14px; border-radius: var(--r-md); background: var(--surface); color: var(--ink);
   font-size: 14.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: var(--shadow-sm); }
 .bubble-row.mine .bubble { border-radius: var(--r-md); }
+.bubble-reply-ref { margin: 0 0 8px; padding: 7px 9px; border-left: 2px solid var(--accent); border-radius: 7px;
+  background: rgba(0, 0, 0, 0.08); }
+.bubble-reply-ref span { display: block; color: var(--accent-bright); font-size: 11.5px; font-weight: 700; }
+.bubble-reply-ref p { margin: 2px 0 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bubble-reply-btn { align-self: flex-start; display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 12px; cursor: pointer;
+  opacity: 0; transform: translateY(-2px); transition: opacity 0.14s, transform 0.14s, color 0.14s, border-color 0.14s; }
+.bubble-row.mine .bubble-reply-btn { align-self: flex-end; }
+.bubble-row:hover .bubble-reply-btn, .bubble-reply-btn:focus-visible { opacity: 1; transform: translateY(0); }
+.bubble-reply-btn:hover { color: var(--accent-bright); border-color: var(--accent-line); }
 .mention-token { font-family: var(--font-mono); font-size: 0.9em; font-weight: 600; padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
 
 /* ── 气泡内图片附件 ─────────────────────────────────────────────── */

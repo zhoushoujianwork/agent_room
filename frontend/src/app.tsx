@@ -13,6 +13,7 @@ import type {
   AccessDecisionEvent,
   AdminUsersReport,
   ChatMessage,
+  Me,
   Participant,
   Room,
   RoomSummary,
@@ -62,6 +63,7 @@ import {
   EventItem,
   groupMessages,
   MessageItem,
+  parseAttachments,
   PermissionToasts,
   splitPermissions,
   type PermissionReply,
@@ -215,7 +217,7 @@ function mentionEndFromContent(content: string, start: number): number {
   return end;
 }
 
-function buildMentionOptions(participants: Participant[], query: string): MentionOption[] {
+function buildMentionOptions(participants: Participant[], query: string, viewerID: string): MentionOption[] {
   const normalized = query.trim().toLowerCase();
   const options: MentionOption[] = [
     { id: "all", label: "All participants", kind: "room", detail: "Room broadcast" },
@@ -227,14 +229,18 @@ function buildMentionOptions(participants: Participant[], query: string): Mentio
       return (left.label || left.id).localeCompare(right.label || right.id);
     })
     .forEach((participant) => {
-      if (participant.kind !== "agent") return;
+      if (participant.kind !== "agent" && participant.kind !== "user") return;
+      if (participant.kind === "user" && participant.id === viewerID) return;
       if (!/^[a-zA-Z0-9_-]{1,64}$/.test(participant.id) || seen.has(participant.id)) return;
       seen.add(participant.id);
       options.push({
         id: participant.id,
         label: participant.label || participant.id,
         kind: participant.kind,
-        detail: participant.metadata?.capabilities || participant.metadata?.provider || "online",
+        detail:
+          participant.kind === "user"
+            ? participant.metadata?.principal_email || "online member"
+            : participant.metadata?.capabilities || participant.metadata?.provider || "online",
       });
     });
   return options
@@ -245,6 +251,34 @@ function buildMentionOptions(participants: Participant[], query: string): Mentio
       );
     })
     .slice(0, 8);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function messagePreview(message: ChatMessage): string {
+  const text = (message.content || "").trim();
+  if (text) return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  const attachments = parseAttachments(message);
+  if (attachments.length > 0) return attachments.length === 1 ? "[图片]" : `[${attachments.length} 张图片]`;
+  return "[消息]";
+}
+
+function mentionsViewer(message: ChatMessage, viewerID: string, me: Me): boolean {
+  if (message.type !== "chat" || message.sender_id === viewerID) return false;
+  const candidates = new Set<string>([viewerID]);
+  if (me.authenticated) {
+    candidates.add(me.user.login);
+    if (me.user.name) candidates.add(me.user.name);
+  }
+  for (const raw of candidates) {
+    const value = raw.trim();
+    if (!value) continue;
+    const pattern = new RegExp(`(^|\\s)@${escapeRegExp(value)}(?=\\s|$|[,:;.!?，。！？、])`, "i");
+    if (pattern.test(message.content || "")) return true;
+  }
+  return false;
 }
 
 function extractMentionTarget(text: string): string | null {
@@ -296,6 +330,8 @@ function InnerApp() {
   // metadata.attachments 引用发出。uploadingCount 驱动缩略图条的上传中占位。
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [uploadingCount, setUploadingCount] = useState(0);
+  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  const [dismissedMentions, setDismissedMentions] = useState<Set<string>>(() => new Set());
   const [stickyTarget, setStickyTarget] = useState<string | null>(null);
   const [mention, setMention] = useState<MentionState>(closedMention());
   const [creatingRoom, setCreatingRoom] = useState(false);
@@ -713,13 +749,36 @@ function InnerApp() {
 
   /* ── Mention bookkeeping ───────────────────────────────────────── */
   const mentionOptions = useMemo(
-    () => buildMentionOptions(participants, mention.query),
-    [participants, mention.query],
+    () => buildMentionOptions(participants, mention.query, viewerID),
+    [participants, mention.query, viewerID],
   );
   useEffect(() => {
     if (!mention.active || mention.selected < mentionOptions.length) return;
     setMention((current) => ({ ...current, selected: 0 }));
   }, [mention.active, mention.selected, mentionOptions.length]);
+
+  const mentionAlerts = useMemo(
+    () =>
+      messages
+        .filter((message) => {
+          const key = message.id || `${message.sender_id}:${message.created_at || message.content}`;
+          return !dismissedMentions.has(key) && mentionsViewer(message, viewerID, me);
+        })
+        .slice(-3),
+    [dismissedMentions, me, messages, viewerID],
+  );
+
+  function dismissMention(message: ChatMessage) {
+    const key = message.id || `${message.sender_id}:${message.created_at || message.content}`;
+    setDismissedMentions((items) => {
+      const next = new Set(items);
+      next.add(key);
+      return next;
+    });
+    if (message.id) {
+      document.getElementById(`msg-${message.id}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }
 
   /* ── Sticky summon target ──────────────────────────────────────── */
   const agents = useMemo(
@@ -781,6 +840,8 @@ function InnerApp() {
   useEffect(() => {
     setPendingAttachments([]);
     setUploadingCount(0);
+    setReplyTo(null);
+    setDismissedMentions(new Set());
   }, [roomID]);
 
   function attachFiles(files: File[]) {
@@ -882,6 +943,11 @@ function InnerApp() {
     });
   }
 
+  function startReply(message: ChatMessage) {
+    setReplyTo(message);
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
+  }
+
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     // While an IME candidate window is open (e.g. typing Chinese), Enter
     // confirms the candidate — it must not send the message.
@@ -958,6 +1024,11 @@ function InnerApp() {
       source: "web",
       connection_id: viewerID,
     };
+    if (replyTo) {
+      metadata.reply_to = replyTo.id || replyTo.created_at || messagePreview(replyTo);
+      metadata.reply_sender = replyTo.sender_id || "";
+      metadata.reply_preview = messagePreview(replyTo);
+    }
     if (pendingAttachments.length > 0) {
       // 与 Go 侧 models.AttachmentRef 对偶的 JSON 数组;只发引用,字节已在平台。
       metadata.attachments = JSON.stringify(
@@ -991,6 +1062,7 @@ function InnerApp() {
     // Clear the draft immediately and, when we summoned an agent, lock the
     // composer until its reply (or command result) lands.
     setContent("");
+    setReplyTo(null);
     setPendingAttachments([]);
     setMention(closedMention());
     setHistIdx(null);
@@ -1474,6 +1546,27 @@ function InnerApp() {
                   </div>
                 ) : (
                   <div className="messages-rail">
+                    {mentionAlerts.length > 0 && (
+                      <div className="mention-alert-stack" aria-live="polite">
+                        {mentionAlerts.map((message) => (
+                          <button
+                            key={message.id || `${message.sender_id}:${message.created_at}`}
+                            type="button"
+                            className="mention-alert-card"
+                            onClick={() => dismissMention(message)}
+                          >
+                            <span className="mention-alert-spark">
+                              <Icon name="at" size={16} />
+                            </span>
+                            <span>
+                              <strong>{message.sender_id || "有人"} @ 了你</strong>
+                              <em>{messagePreview(message)}</em>
+                            </span>
+                            <Icon name="x" size={14} />
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     {loadingMore && (
                       <div className="messages-backfill" aria-live="polite">
                         <span className="messages-backfill-spin" /> 加载更早消息…
@@ -1512,12 +1605,15 @@ function InnerApp() {
                         );
                       }
                       return (
-                        <MessageItem
-                          key={group.items[0].id || index}
-                          message={group.items[0]}
-                          viewerID={viewerID}
-                          dark={dark}
-                        />
+                        <div id={group.items[0].id ? `msg-${group.items[0].id}` : undefined} key={group.items[0].id || index}>
+                          <MessageItem
+                            message={group.items[0]}
+                            viewerID={viewerID}
+                            dark={dark}
+                            mentioned={mentionsViewer(group.items[0], viewerID, me)}
+                            onReply={startReply}
+                          />
+                        </div>
                       );
                     })}
                   </div>
@@ -1536,6 +1632,9 @@ function InnerApp() {
                 mentionOptions={mentionOptions}
                 attachments={pendingAttachments}
                 uploadingCount={uploadingCount}
+                replyTo={replyTo}
+                replyPreview={replyTo ? messagePreview(replyTo) : ""}
+                onCancelReply={() => setReplyTo(null)}
                 onAttachFiles={attachFiles}
                 onRemoveAttachment={removeAttachment}
                 onContentChange={onContentChange}
