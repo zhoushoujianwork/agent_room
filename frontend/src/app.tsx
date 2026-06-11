@@ -1019,7 +1019,7 @@ function InnerApp() {
     // Explicit @mention always wins; otherwise fall back to the room's
     // default summon target so the user doesn't have to @ every time.
     const targetID = extractMentionTarget(text) || stickyTarget;
-    const hasAgentTarget = Boolean(targetID);
+    const hasAgentTarget = Boolean(targetID && agents.some((agent) => agent.id === targetID));
     const metadata: Record<string, string> = {
       source: "web",
       connection_id: viewerID,
