@@ -81,6 +81,25 @@ func migrate(db *sql.DB) error {
             login_count   INTEGER NOT NULL DEFAULT 0
         );`,
 		`CREATE INDEX IF NOT EXISTS idx_user_activity_last_login ON user_activity(last_login_at);`,
+		`CREATE TABLE IF NOT EXISTS agents (
+            agent_id     TEXT PRIMARY KEY,
+            owner_login  TEXT NOT NULL,
+            label        TEXT NOT NULL DEFAULT '',
+            provider     TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            revoked      INTEGER NOT NULL DEFAULT 0
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_login);`,
+		`CREATE TABLE IF NOT EXISTS agent_tokens (
+            token_hash   TEXT PRIMARY KEY,
+            owner_login  TEXT NOT NULL,
+            note         TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL,
+            last_used_at TEXT NOT NULL DEFAULT '',
+            revoked      INTEGER NOT NULL DEFAULT 0
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_tokens_owner ON agent_tokens(owner_login);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

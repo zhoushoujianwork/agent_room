@@ -16,9 +16,13 @@ type Config struct {
 	BridgeMode    string
 	AgentID       string
 	AgentLabel    string
-	Capabilities  string
-	Provider      string
-	SystemPrompt  string
+	// AgentToken is the long-lived credential (bridge side) that binds this
+	// agent to a user account on the relay. Sent as the agent_token WS query
+	// param at handshake. Empty = anonymous agent (backward compatible).
+	AgentToken   string
+	Capabilities string
+	Provider     string
+	SystemPrompt string
 	// ContextFile is an optional path to a local file (e.g. an incident
 	// handoff note) whose contents are injected into the agent prompt at
 	// startup as trusted operator-provided background. Agent mode only;
@@ -161,6 +165,7 @@ func Load() Config {
 		BridgeMode:    envString("AGENT_ROOM_BRIDGE_MODE", "agent"),
 		AgentID:       envString("AGENT_ROOM_AGENT_ID", ""),
 		AgentLabel:    envString("AGENT_ROOM_AGENT_LABEL", ""),
+		AgentToken:    envString("AGENT_ROOM_AGENT_TOKEN", ""),
 		Capabilities:  envString("AGENT_ROOM_AGENT_CAPABILITIES", ""),
 		Provider:      envString("AGENT_ROOM_PROVIDER", "claude"),
 		SystemPrompt:  envString("AGENT_ROOM_SYSTEM_PROMPT", ""),

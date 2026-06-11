@@ -80,6 +80,7 @@ func runBridge(cfg config.Config, log *slog.Logger, args []string) error {
 	fs.StringVar(&cfg.BridgeMode, "bridge-mode", cfg.BridgeMode, "bridge mode: agent or executor")
 	fs.StringVar(&cfg.AgentID, "agent-id", cfg.AgentID, "local agent id")
 	fs.StringVar(&cfg.AgentLabel, "agent-label", cfg.AgentLabel, "display label for this local agent")
+	fs.StringVar(&cfg.AgentToken, "agent-token", cfg.AgentToken, "agent token binding this agent to a relay user account (overrides AGENT_ROOM_AGENT_TOKEN); empty = anonymous agent")
 	fs.StringVar(&cfg.Capabilities, "agent-capabilities", cfg.Capabilities, "short description of what this local agent can do")
 	fs.StringVar(&cfg.Provider, "provider", cfg.Provider, "local CLI provider")
 	fs.StringVar(&cfg.SystemPrompt, "system-prompt", cfg.SystemPrompt, "additional local owner instructions")
@@ -187,6 +188,13 @@ func resolveBridgeDefaults(cfg *config.Config) error {
 		cfg.RelayURL = base + "/v1/rooms/" + url.PathEscape(cfg.RoomID) + "/ws"
 	} else {
 		cfg.RelayURL = normalizeRelayWSURL(cfg.RelayURL, cfg.RoomID)
+	}
+
+	// Carry the agent token (when set) as a handshake query param so the relay
+	// can bind this agent to its owner. Appended after the room path is fixed so
+	// it survives both the default and normalized URL branches above.
+	if tok := strings.TrimSpace(cfg.AgentToken); tok != "" {
+		cfg.RelayURL = appendQueryParam(cfg.RelayURL, "agent_token", tok)
 	}
 
 	// Executor mode: ensure there's a token so commands aren't accepted
@@ -319,6 +327,21 @@ func normalizeRelayWSURL(raw, roomID string) string {
 		return u.String()
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/v1/rooms/" + url.PathEscape(roomID) + "/ws"
+	return u.String()
+}
+
+// appendQueryParam adds (or overwrites) a single query parameter on a URL,
+// preserving the rest of the URL. On a parse failure it returns the input
+// unchanged so the dialer surfaces the original error rather than this helper
+// silently dropping the value.
+func appendQueryParam(raw, key, value string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := u.Query()
+	q.Set(key, value)
+	u.RawQuery = q.Encode()
 	return u.String()
 }
 
