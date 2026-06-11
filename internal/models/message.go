@@ -35,11 +35,20 @@ const (
 	// logging. The bridge applies it to its provider's in-memory runtime
 	// config; an empty field means "fall back to the bridge local default".
 	ControlOperationConfigUpdate = "config_update"
-	// ControlOperationJoinRoom 指示 bridge 建立到指定房间的连接（relay→bridge，仅控制连接）。
+
+	// ControlOperationJoinRoom is sent by the relay over the control connection
+	// to instruct the bridge to join (or remain in) a given room.
+	// metadata["room_id"] names the target room.
 	ControlOperationJoinRoom = "join_room"
-	// ControlOperationLeaveRoom 指示 bridge 断开指定房间的连接（relay→bridge，仅控制连接）。
+
+	// ControlOperationLeaveRoom is sent by the relay over the control connection
+	// to instruct the bridge to leave a given room.
+	// metadata["room_id"] names the target room.
 	ControlOperationLeaveRoom = "leave_room"
-	// ControlOperationRoomStateReport 是 bridge 上报当前实际已连接房间列表（bridge→relay，仅控制连接）。
+
+	// ControlOperationRoomStateReport is sent by the bridge to the relay over
+	// the control connection to report the current set of connected rooms.
+	// metadata["rooms"] is a comma-separated list of room ids.
 	ControlOperationRoomStateReport = "room_state_report"
 )
 

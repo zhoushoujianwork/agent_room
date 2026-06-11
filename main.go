@@ -139,14 +139,19 @@ func runBridge(cfg config.Config, log *slog.Logger, args []string) error {
 	}
 
 	// Single-instance guard: refuse to start if another live bridge with the
-	// same agent id is already connected to this room. Two duplicates would
-	// both answer every message — tripling the turn budget and showing up as
-	// "N sessions" in the sidebar. The flock is released on process exit, so
-	// stale/orphaned bridges never block a fresh start.
-	unlock, err := acquireBridgeLock(cfg.AgentID, cfg.RoomID)
+	// same identity is already running. In agent+token mode one bridge process
+	// serves all rooms, so we lock only by agentID. In all other modes (legacy
+	// agent, executor) we lock by (agentID, roomID) as before.
+	isAgentWithToken := strings.EqualFold(strings.TrimSpace(cfg.BridgeMode), "agent") &&
+		strings.TrimSpace(cfg.AgentToken) != ""
+	lockRoomID := cfg.RoomID
+	if isAgentWithToken {
+		lockRoomID = "" // lock only on agentID
+	}
+	unlock, err := acquireBridgeLock(cfg.AgentID, lockRoomID)
 	if err != nil {
 		if errors.Is(err, errBridgeAlreadyRunning) {
-			return fmt.Errorf("%w (agent %q, room %q); stop the other process or pass a different -agent-id", err, cfg.AgentID, cfg.RoomID)
+			return fmt.Errorf("%w (agent %q, room %q); stop the other process or pass a different -agent-id", err, cfg.AgentID, lockRoomID)
 		}
 		return err
 	}
@@ -161,7 +166,14 @@ func runBridge(cfg config.Config, log *slog.Logger, args []string) error {
 // ~/.agent-room/ so a bridge re-appears as the same participant across
 // restarts.
 func resolveBridgeDefaults(cfg *config.Config) error {
-	if strings.TrimSpace(cfg.RoomID) == "" {
+	// In agent+token mode the bridge can start without a room (it will receive
+	// join_room directives over the control connection). Otherwise a room is
+	// required and we prompt interactively when running from a TTY.
+	agentTokenSet := strings.TrimSpace(cfg.AgentToken) != ""
+	agentMode := strings.EqualFold(strings.TrimSpace(cfg.BridgeMode), "agent") || strings.TrimSpace(cfg.BridgeMode) == ""
+	requireRoom := !(agentMode && agentTokenSet)
+
+	if strings.TrimSpace(cfg.RoomID) == "" && requireRoom {
 		room, err := promptRoomFromTTY(os.Stdin, os.Stderr)
 		if err != nil {
 			return err
@@ -171,7 +183,7 @@ func resolveBridgeDefaults(cfg *config.Config) error {
 	// Whether the value came from the flag, an env var, or the TTY prompt,
 	// accept full URLs and ?room=… query strings transparently.
 	cfg.RoomID = parseRoomIDFromInput(cfg.RoomID)
-	if cfg.RoomID == "" {
+	if cfg.RoomID == "" && requireRoom {
 		return errors.New("room id is required (use -room, set AGENT_ROOM_ROOM_ID, or run interactively)")
 	}
 
@@ -185,15 +197,24 @@ func resolveBridgeDefaults(cfg *config.Config) error {
 
 	if strings.TrimSpace(cfg.RelayURL) == "" {
 		base := strings.TrimRight(defaultRelayBase, "/")
-		cfg.RelayURL = base + "/v1/rooms/" + url.PathEscape(cfg.RoomID) + "/ws"
-	} else {
+		if cfg.RoomID != "" {
+			cfg.RelayURL = base + "/v1/rooms/" + url.PathEscape(cfg.RoomID) + "/ws"
+		} else {
+			// Token mode with no initial room: store just the base so that
+			// buildRoomURL / agentControlURL can derive the correct paths later.
+			cfg.RelayURL = base
+		}
+	} else if cfg.RoomID != "" {
 		cfg.RelayURL = normalizeRelayWSURL(cfg.RelayURL, cfg.RoomID)
+	} else {
+		// Bare origin provided; normalise scheme only (no room path to append).
+		cfg.RelayURL = normalizeWSScheme(cfg.RelayURL)
 	}
 
 	// Carry the agent token (when set) as a handshake query param so the relay
 	// can bind this agent to its owner. Appended after the room path is fixed so
 	// it survives both the default and normalized URL branches above.
-	if tok := strings.TrimSpace(cfg.AgentToken); tok != "" {
+	if tok := strings.TrimSpace(cfg.AgentToken); tok != "" && cfg.RoomID != "" {
 		cfg.RelayURL = appendQueryParam(cfg.RelayURL, "agent_token", tok)
 	}
 
@@ -342,6 +363,22 @@ func appendQueryParam(raw, key, value string) string {
 	q := u.Query()
 	q.Set(key, value)
 	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// normalizeWSScheme converts http(s) to ws(s) and leaves ws/wss unchanged.
+// Used when no room path needs to be appended (token mode, no initial room).
+func normalizeWSScheme(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	}
 	return u.String()
 }
 
