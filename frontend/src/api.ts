@@ -229,6 +229,31 @@ export async function revokeAgentToken(hashPrefix: string): Promise<void> {
   if (!res.ok) throw new Error(`revoke token → ${res.status}`);
 }
 
+// joinAgentToRoom 把自己的 agent 加入指定房间；delivered=false 表示 agent
+// 控制连接不在线，上线后由 relay 对账补发加入指令。
+export async function joinAgentToRoom(
+  roomID: string,
+  agentID: string,
+): Promise<{ ok: boolean; delivered: boolean }> {
+  return sendJSON<{ ok: boolean; delivered: boolean }>(
+    `/v1/rooms/${encodeURIComponent(roomID)}/agents`,
+    "POST",
+    { agent_id: agentID },
+  );
+}
+
+// removeAgentFromRoom 把 agent 移出指定房间（agent 主人 / 房间主人 / admin）。
+export async function removeAgentFromRoom(
+  roomID: string,
+  agentID: string,
+): Promise<void> {
+  const res = await fetch(
+    `/v1/rooms/${encodeURIComponent(roomID)}/agents/${encodeURIComponent(agentID)}`,
+    { method: "DELETE", credentials: "same-origin" },
+  );
+  if (!res.ok) throw new Error(`remove agent → ${res.status}`);
+}
+
 // getAgentConfig 读取 agent 启动配置；未保存过时后端返回同形空对象。
 export async function getAgentConfig(agentID: string): Promise<AgentConfig> {
   return getJSON<AgentConfig>(
