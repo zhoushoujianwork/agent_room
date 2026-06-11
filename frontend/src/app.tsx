@@ -1712,7 +1712,12 @@ function InnerApp() {
           )}
           {tab === "agents" && (
             <section className="messages">
-              <AgentsPanel participants={participants} onCopyMention={copyMention} />
+              <AgentsPanel
+                participants={participants}
+                onCopyMention={copyMention}
+                roomID={roomID}
+                currentLogin={me.authenticated ? me.user.login : null}
+              />
             </section>
           )}
           {tab === "settings" && (

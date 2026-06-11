@@ -1,5 +1,5 @@
-import { useState } from "react";
-import type { ChatMessage, Participant, Room, RoomSummary } from "./types";
+import { useCallback, useEffect, useState } from "react";
+import type { Agent, ChatMessage, Participant, Room, RoomSummary } from "./types";
 import { Icon, OsGlyph, osLabel } from "./icons";
 import { Markdown } from "./markdown";
 import { Chip, ModeBadge, OsAvatar, StatusDot } from "./ui";
@@ -15,6 +15,7 @@ import {
 } from "./lib";
 import { isAdmin as isAdminMe, useAuth, useTheme } from "./auth";
 import { splitPermissions, type PermissionReply } from "./messages";
+import { joinAgentToRoom, listAgents, removeAgentFromRoom } from "./api";
 
 /* ── Activity tab ──────────────────────────────────────────────────── */
 
@@ -342,82 +343,278 @@ export function SummaryPanel({ summary, loading, onRefresh }: SummaryPanelProps)
 interface AgentsPanelProps {
   participants: Participant[];
   onCopyMention: (id: string) => void;
+  roomID: string;
+  currentLogin: string | null;
 }
 
-export function AgentsPanel({ participants, onCopyMention }: AgentsPanelProps) {
+export function AgentsPanel({ participants, onCopyMention, roomID, currentLogin }: AgentsPanelProps) {
   const { theme } = useTheme();
   const dark = theme !== "paper";
   const agents = participants.filter((p) => p.kind === "agent");
-  if (agents.length === 0) {
-    return (
-      <div className="panel-wrap">
-        <div className="panel-empty">暂无 Bridge 在线 — 在本机启动 Bridge 加入房间。</div>
-      </div>
-    );
-  }
+
   return (
     <div className="panel-wrap">
-      <div className="agent-grid">
-        {agents.map((p) => {
-          const hue = hueFromID(p.id);
-          const tint = agentTint(hue, dark);
-          const mode = p.metadata?.mode || "agent";
-          const os = normalizeOS(p.metadata?.os);
-          return (
-            <div className="agent-card" key={p.id} style={{ ["--tint" as string]: tint.solid }}>
-              <div className="agent-card-top">
-                <OsAvatar
-                  person={{ id: p.id, label: p.label || p.id, kind: "agent", hue }}
-                  dark={dark}
-                  size={40}
-                  os={p.metadata?.os}
-                />
-                <div className="agent-card-id">
-                  <strong style={{ color: tint.text }}>{p.label || p.id}</strong>
-                  <span>{p.metadata?.role || p.metadata?.provider || ""}</span>
-                </div>
-                <ModeBadge mode={mode} full />
-              </div>
-              <div className="agent-meta">
-                {os && (
-                  <span className="agent-os">
-                    <OsGlyph os={os} size={14} /> {osLabel(os)}
-                  </span>
-                )}
-                {p.metadata?.device && (
-                  <span>
-                    <Icon name="cpu" size={13} /> {p.metadata.device}
-                  </span>
-                )}
-                {p.metadata?.version && (
-                  <span className="agent-ver" title="bridge 版本">
-                    v{p.metadata.version}
-                  </span>
-                )}
-                <span>
-                  <StatusDot tone="live" pulse /> 在线 · {relativeTime(p.last_seen_at)}
-                </span>
-                {p.metadata?.capabilities && (
-                  <span className="agent-cap">{p.metadata.capabilities}</span>
-                )}
-              </div>
-              <div className="agent-card-foot">
-                <code>@{p.id}</code>
-                <button
-                  type="button"
-                  className="icon-btn icon-btn-ghost"
-                  title="复制 @mention"
-                  aria-label="复制 @mention"
-                  onClick={() => onCopyMention(p.id)}
-                >
-                  <Icon name="copy" size={14} />
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      {agents.length === 0 ? (
+        <div className="panel-empty">暂无 Bridge 在线 — 在本机启动 Bridge 加入房间。</div>
+      ) : (
+        <div className="agent-grid">
+          {agents.map((p) => {
+            const hue = hueFromID(p.id);
+            const tint = agentTint(hue, dark);
+            const mode = p.metadata?.mode || "agent";
+            const os = normalizeOS(p.metadata?.os);
+            const isOwn = currentLogin != null && p.metadata?.owner_login === currentLogin;
+            return (
+              <AgentCard
+                key={p.id}
+                p={p}
+                hue={hue}
+                tint={tint}
+                mode={mode}
+                os={os}
+                dark={dark}
+                isOwn={isOwn}
+                roomID={roomID}
+                onCopyMention={onCopyMention}
+              />
+            );
+          })}
+        </div>
+      )}
+      <JoinMyAgentSection
+        roomID={roomID}
+        currentLogin={currentLogin}
+        participants={participants}
+      />
     </div>
+  );
+}
+
+/* ── 单个在线 agent 卡片 ──────────────────────────────────────────── */
+
+function AgentCard({
+  p,
+  hue,
+  tint,
+  mode,
+  os,
+  dark,
+  isOwn,
+  roomID,
+  onCopyMention,
+}: {
+  p: Participant;
+  hue: number;
+  tint: { solid: string; text: string };
+  mode: string;
+  os: string | null;
+  dark: boolean;
+  isOwn: boolean;
+  roomID: string;
+  onCopyMention: (id: string) => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [removeMsg, setRemoveMsg] = useState<string | null>(null);
+
+  const handleRemove = useCallback(() => {
+    setRemoving(true);
+    setRemoveMsg(null);
+    removeAgentFromRoom(roomID, p.id)
+      .then(() => {
+        setRemoveMsg("已发出移除指令，等待 presence 离开事件…");
+        setConfirming(false);
+      })
+      .catch((err: unknown) => {
+        setRemoveMsg(err instanceof Error ? err.message : "移出失败，请稍后重试");
+        setConfirming(false);
+      })
+      .finally(() => setRemoving(false));
+  }, [roomID, p.id]);
+
+  return (
+    <div className="agent-card" style={{ ["--tint" as string]: tint.solid }}>
+      <div className="agent-card-top">
+        <OsAvatar
+          person={{ id: p.id, label: p.label || p.id, kind: "agent", hue }}
+          dark={dark}
+          size={40}
+          os={p.metadata?.os}
+        />
+        <div className="agent-card-id">
+          <strong style={{ color: tint.text }}>{p.label || p.id}</strong>
+          <span>{p.metadata?.role || p.metadata?.provider || ""}</span>
+        </div>
+        <ModeBadge mode={mode} full />
+      </div>
+      <div className="agent-meta">
+        {os && (
+          <span className="agent-os">
+            <OsGlyph os={os} size={14} /> {osLabel(os)}
+          </span>
+        )}
+        {p.metadata?.device && (
+          <span>
+            <Icon name="cpu" size={13} /> {p.metadata.device}
+          </span>
+        )}
+        {p.metadata?.version && (
+          <span className="agent-ver" title="bridge 版本">
+            v{p.metadata.version}
+          </span>
+        )}
+        <span>
+          <StatusDot tone="live" pulse /> 在线 · {relativeTime(p.last_seen_at)}
+        </span>
+        {p.metadata?.capabilities && (
+          <span className="agent-cap">{p.metadata.capabilities}</span>
+        )}
+      </div>
+      <div className="agent-card-foot">
+        <code>@{p.id}</code>
+        <button
+          type="button"
+          className="icon-btn icon-btn-ghost"
+          title="复制 @mention"
+          aria-label="复制 @mention"
+          onClick={() => onCopyMention(p.id)}
+        >
+          <Icon name="copy" size={14} />
+        </button>
+      </div>
+      {isOwn && (
+        <div className="agent-card-remove">
+          {confirming ? (
+            <span className="agent-mgr-confirm">
+              <button
+                type="button"
+                className="btn btn-sm btn-danger"
+                onClick={handleRemove}
+                disabled={removing}
+              >
+                {removing ? "移出中…" : "确认移出"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setConfirming(false)}
+                disabled={removing}
+              >
+                取消
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setConfirming(true)}
+            >
+              <Icon name="x" size={13} /> 移出本房间
+            </button>
+          )}
+          {removeMsg && <span className="agent-join-msg">{removeMsg}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── 加入我的 Agent 区块 ──────────────────────────────────────────── */
+
+function JoinMyAgentSection({
+  roomID,
+  currentLogin,
+  participants,
+}: {
+  roomID: string;
+  currentLogin: string | null;
+  participants: Participant[];
+}) {
+  const [myAgents, setMyAgents] = useState<Agent[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!currentLogin) return;
+    listAgents()
+      .then((list) => {
+        setMyAgents(list);
+        setLoaded(true);
+      })
+      .catch(() => {
+        // 静默失败：房间页不打扰
+        setLoaded(false);
+      });
+  }, [currentLogin]);
+
+  if (!currentLogin || !loaded) return null;
+
+  const joinable = myAgents.filter(
+    (a) => !participants.some((p) => p.kind === "agent" && p.id === a.agent_id),
+  );
+
+  if (joinable.length === 0) return null;
+
+  return (
+    <div className="join-agents-section">
+      <div className="join-agents-head">
+        <Icon name="bot" size={14} /> 加入我的 Agent
+      </div>
+      <ul className="join-agents-list">
+        {joinable.map((agent) => (
+          <JoinAgentRow
+            key={agent.agent_id}
+            agent={agent}
+            roomID={roomID}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function JoinAgentRow({ agent, roomID }: { agent: Agent; roomID: string }) {
+  const [pending, setPending] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const shortID = (id: string) =>
+    id.length <= 16 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
+
+  const handleJoin = useCallback(() => {
+    setPending(true);
+    setMsg(null);
+    joinAgentToRoom(roomID, agent.agent_id)
+      .then((res) => {
+        if (res.delivered) {
+          setMsg("已下发加入指令，agent 连接中…");
+        } else {
+          setMsg("已登记。agent 当前离线，上线后将自动加入本房间");
+        }
+      })
+      .catch((err: unknown) => {
+        const raw = err instanceof Error ? err.message : "操作失败";
+        // 提取 403 后端文案
+        const match = raw.match(/→ \d+: (.+)/);
+        setMsg(match ? match[1] : raw);
+      })
+      .finally(() => setPending(false));
+  }, [roomID, agent.agent_id]);
+
+  return (
+    <li className="join-agent-row">
+      <span className="join-agent-label">
+        <StatusDot tone={agent.online ? "live" : "off"} pulse={agent.online} size={8} />
+        {agent.label || shortID(agent.agent_id)}
+      </span>
+      <button
+        type="button"
+        className="btn btn-sm"
+        onClick={handleJoin}
+        disabled={pending || msg != null}
+      >
+        {pending ? "加入中…" : "加入本房间"}
+      </button>
+      {msg && <span className="agent-join-msg">{msg}</span>}
+    </li>
   );
 }
 

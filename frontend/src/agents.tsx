@@ -207,7 +207,7 @@ function AgentsList({
                         : ""}
                     </span>
                   </div>
-                  {agent.online && agent.rooms && agent.rooms.length > 0 && (
+                  {agent.rooms && agent.rooms.length > 0 ? (
                     <div className="agent-mgr-rooms">
                       {agent.rooms.map((roomID) => (
                         <button
@@ -221,6 +221,8 @@ function AgentsList({
                         </button>
                       ))}
                     </div>
+                  ) : (
+                    <span className="agent-mgr-no-rooms">未加入任何房间</span>
                   )}
                 </div>
               </div>
