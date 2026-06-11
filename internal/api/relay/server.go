@@ -37,6 +37,7 @@ type Server struct {
 	cfg         config.Config
 	service     *chat.Service
 	rooms       models.RoomStore
+	agents      AgentStore
 	summaries   models.SummaryStore
 	summarizer  *summary.Service
 	attachments models.AttachmentStore
@@ -59,7 +60,14 @@ func NewServer(cfg config.Config, service *chat.Service, rooms models.RoomStore,
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
 	}
+	// Agent-ownership persistence is an optional capability: production stores
+	// (SQLite, in-memory) implement AgentStore; legacy/test stores may not, in
+	// which case the feature is simply off.
+	if as, ok := rooms.(AgentStore); ok {
+		s.agents = as
+	}
 	s.hub = newHub(service, logger)
+	s.hub.agents = s.agents
 	return s
 }
 
@@ -107,6 +115,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/me", s.handleMe)
 	mux.HandleFunc("/v1/admin/rooms", s.handleAdminRooms)
 	mux.HandleFunc("/v1/admin/users", s.handleAdminUsers)
+	mux.HandleFunc("/v1/agents", s.handleAgentsList)
+	mux.HandleFunc("/v1/agents/tokens", s.handleAgentTokens)
+	mux.HandleFunc("/v1/agents/tokens/", s.handleAgentTokenItem)
+	mux.HandleFunc("/v1/agents/", s.handleAgentItem)
 	mux.HandleFunc("/v1/rooms", s.handleCreateRoom)
 	mux.HandleFunc("/v1/rooms/", s.handleRoom)
 	return mux
@@ -622,6 +634,22 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, roomI
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, roomID string) {
+	// Resolve agent ownership before upgrading so an invalid/revoked token
+	// fails with a clean HTTP error instead of a mid-stream close. Carrying no
+	// agent_token stays anonymous (backward compatible); carrying an invalid
+	// one is rejected. When the store doesn't support agent ownership the token
+	// is ignored (feature off), preserving legacy behavior.
+	ownerLogin := ""
+	if token := strings.TrimSpace(r.URL.Query().Get("agent_token")); token != "" && s.agents != nil {
+		owner, ok := s.validateAgentToken(r.Context(), token)
+		if !ok {
+			s.logger.Warn("rejected agent: invalid token", slog.String("room_id", roomID))
+			writeError(w, http.StatusUnauthorized, "invalid or revoked agent token")
+			return
+		}
+		ownerLogin = owner
+	}
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Warn("websocket upgrade failed", slog.String("room_id", roomID), slog.Any("error", err))
@@ -630,6 +658,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request, roomID string)
 
 	audit := r.URL.Query().Get("audit") == "1" && s.isAdminRequest(r)
 	client := newClient(s.hub, roomID, conn, r.RemoteAddr, r.URL.Query(), audit)
+	if ownerLogin != "" {
+		client.owner = ownerLogin
+		if client.participant.Metadata == nil {
+			client.participant.Metadata = map[string]string{}
+		}
+		client.participant.Metadata["owner_login"] = ownerLogin
+		s.logger.Info("agent bound to owner",
+			slog.String("room_id", roomID), slog.String("owner_login", ownerLogin))
+	}
 	s.hub.register(client)
 
 	go client.writeLoop()
@@ -651,8 +688,11 @@ func parseRoomPath(path string) (string, string, bool) {
 type hub struct {
 	service *chat.Service
 	logger  *slog.Logger
-	mu      sync.RWMutex
-	rooms   map[string]map[*client]struct{}
+	// agents, when set, persists agent->owner bindings as agents come online.
+	// Nil when the backing store doesn't support agent ownership.
+	agents AgentStore
+	mu     sync.RWMutex
+	rooms  map[string]map[*client]struct{}
 	// execTokens maps roomID -> executor agent id -> exec_token. The relay is
 	// the sole keeper of these tokens: an executor reports its token in its
 	// presence message, the relay records it here (never storing or
@@ -869,8 +909,69 @@ func (h *hub) updateParticipant(c *client, msg models.ChatMessage) {
 			if strings.TrimSpace(value) == "" || isSensitiveMetadataKey(key) {
 				continue
 			}
+			// owner_login is server-derived from the agent token; never let a
+			// client self-report it. It is (re)stamped from c.owner below.
+			if key == "owner_login" {
+				continue
+			}
 			c.participant.Metadata[key] = value
 		}
+	}
+	// Keep the authoritative owner_login on the participant so presence
+	// broadcasts carry the (display-safe) owner; anonymous connections have
+	// none and any client-supplied value was dropped above.
+	if c.owner != "" {
+		if c.participant.Metadata == nil {
+			c.participant.Metadata = map[string]string{}
+		}
+		c.participant.Metadata["owner_login"] = c.owner
+	} else {
+		delete(c.participant.Metadata, "owner_login")
+	}
+}
+
+// bindAgentOwner upserts the durable agents row for a connection that arrived
+// with a valid agent token, once the presence message reveals the real agent
+// id (SenderID). An agent previously unbound by its owner (revoked) is kept
+// anonymous: we drop the injected owner rather than re-binding it.
+func (h *hub) bindAgentOwner(ctx context.Context, c *client, msg models.ChatMessage) {
+	if h.agents == nil || c.owner == "" {
+		return
+	}
+	agentID := strings.TrimSpace(msg.SenderID)
+	if agentID == "" {
+		return
+	}
+	kind := msg.SenderKind
+	if kind == "" {
+		kind = c.participant.Kind
+	}
+	if kind != models.SenderKindAgent {
+		return
+	}
+	if existing, err := h.agents.GetAgent(ctx, agentID); err == nil && existing != nil && existing.Revoked {
+		h.mu.Lock()
+		c.owner = ""
+		delete(c.participant.Metadata, "owner_login")
+		h.mu.Unlock()
+		h.logger.Info("agent left anonymous: binding revoked by owner",
+			slog.String("agent_id", agentID))
+		return
+	}
+	label := strings.TrimSpace(msg.Metadata["label"])
+	if label == "" {
+		label = c.participant.Label
+	}
+	provider := strings.TrimSpace(msg.Metadata["provider"])
+	if err := h.agents.UpsertAgent(ctx, models.Agent{
+		AgentID:    agentID,
+		OwnerLogin: c.owner,
+		Label:      label,
+		Provider:   provider,
+		LastSeenAt: time.Now().UTC(),
+	}); err != nil {
+		h.logger.Warn("upsert agent binding failed",
+			slog.String("agent_id", agentID), slog.Any("error", err))
 	}
 }
 
@@ -1063,6 +1164,10 @@ type client struct {
 	send        chan outgoing
 	participant models.Participant
 	audit       bool
+	// owner is the GitHub login this connection's agent token resolved to at
+	// handshake; empty for anonymous connections. It is server-derived and
+	// authoritative — clients can never set their own owner_login via metadata.
+	owner string
 }
 
 func newClient(hub *hub, roomID string, conn *websocket.Conn, remoteAddr string, query map[string][]string, audit bool) *client {
@@ -1171,6 +1276,7 @@ func (c *client) readLoop(ctx context.Context) {
 		// 数据帧本身就是活性证明（兼容不回 pong 的极简客户端）。
 		_ = c.conn.SetReadDeadline(time.Now().Add(clientPongWait))
 		c.hub.updateParticipant(c, msg)
+		c.hub.bindAgentOwner(ctx, c, msg)
 		if _, err := c.hub.Publish(ctx, c.roomID, msg); err != nil {
 			c.hub.logger.Error("publish message failed", slog.String("room_id", c.roomID), slog.Any("error", err))
 			return

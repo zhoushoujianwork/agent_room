@@ -1,0 +1,248 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"agent-room/internal/models"
+)
+
+// UpsertAgent records (or refreshes) the binding between an agent id and its
+// owner. On reconnect it updates owner/last_seen and clears revoked, so a
+// previously seen agent that comes back with a valid token re-binds. Label and
+// provider are only overwritten when the incoming value is non-empty, so a
+// presence update that omits them does not wipe what we already have.
+func (s *Store) UpsertAgent(ctx context.Context, agent models.Agent) error {
+	now := agent.LastSeenAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	created := agent.CreatedAt
+	if created.IsZero() {
+		created = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO agents (agent_id, owner_login, label, provider, created_at, last_seen_at, revoked)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(agent_id) DO UPDATE SET
+            owner_login  = excluded.owner_login,
+            label        = CASE WHEN excluded.label <> '' THEN excluded.label ELSE agents.label END,
+            provider     = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE agents.provider END,
+            last_seen_at = excluded.last_seen_at,
+            revoked      = 0`,
+		agent.AgentID,
+		agent.OwnerLogin,
+		agent.Label,
+		agent.Provider,
+		created.UTC().Format(time.RFC3339Nano),
+		now.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite upsert agent: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetAgent(ctx context.Context, agentID string) (*models.Agent, error) {
+	row := s.db.QueryRowContext(ctx, `
+        SELECT agent_id, owner_login, label, provider, created_at, last_seen_at, revoked
+        FROM agents WHERE agent_id = ?`, agentID)
+	return scanAgent(row)
+}
+
+func (s *Store) ListAgentsByOwner(ctx context.Context, owner string) ([]models.Agent, error) {
+	return s.listAgents(ctx, `
+        SELECT agent_id, owner_login, label, provider, created_at, last_seen_at, revoked
+        FROM agents WHERE owner_login = ? AND revoked = 0
+        ORDER BY last_seen_at DESC`, owner)
+}
+
+func (s *Store) ListAllAgents(ctx context.Context) ([]models.Agent, error) {
+	return s.listAgents(ctx, `
+        SELECT agent_id, owner_login, label, provider, created_at, last_seen_at, revoked
+        FROM agents WHERE revoked = 0
+        ORDER BY last_seen_at DESC`)
+}
+
+func (s *Store) listAgents(ctx context.Context, query string, args ...any) ([]models.Agent, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list agents: %w", err)
+	}
+	defer rows.Close()
+	out := make([]models.Agent, 0)
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite list agents rows: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeAgent unbinds an agent (sets revoked=1). The row is kept for audit but
+// excluded from owner listings; a later reconnect with a valid token re-binds
+// via UpsertAgent (which resets revoked=0).
+func (s *Store) RevokeAgent(ctx context.Context, agentID string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE agents SET revoked = 1 WHERE agent_id = ?`, agentID)
+	if err != nil {
+		return fmt.Errorf("sqlite revoke agent: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) InsertAgentToken(ctx context.Context, token models.AgentToken) error {
+	created := token.CreatedAt
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO agent_tokens (token_hash, owner_login, note, created_at, last_used_at, revoked)
+        VALUES (?, ?, ?, ?, '', 0)`,
+		token.TokenHash,
+		token.OwnerLogin,
+		token.Note,
+		created.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite insert agent token: %w", err)
+	}
+	return nil
+}
+
+// LookupAgentToken returns the token row for a given hash, or ErrNotFound.
+func (s *Store) LookupAgentToken(ctx context.Context, hash string) (*models.AgentToken, error) {
+	row := s.db.QueryRowContext(ctx, `
+        SELECT token_hash, owner_login, note, created_at, last_used_at, revoked
+        FROM agent_tokens WHERE token_hash = ?`, hash)
+	return scanAgentToken(row)
+}
+
+func (s *Store) TouchAgentTokenLastUsed(ctx context.Context, hash string, t time.Time) error {
+	if t.IsZero() {
+		t = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE agent_tokens SET last_used_at = ? WHERE token_hash = ?`,
+		t.UTC().Format(time.RFC3339Nano), hash)
+	if err != nil {
+		return fmt.Errorf("sqlite touch agent token: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListAgentTokensByOwner(ctx context.Context, owner string) ([]models.AgentToken, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT token_hash, owner_login, note, created_at, last_used_at, revoked
+        FROM agent_tokens WHERE owner_login = ? AND revoked = 0
+        ORDER BY created_at DESC`, owner)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list agent tokens: %w", err)
+	}
+	defer rows.Close()
+	out := make([]models.AgentToken, 0)
+	for rows.Next() {
+		t, err := scanAgentToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite list agent tokens rows: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeAgentTokenByPrefix marks all of this owner's active tokens whose hash
+// starts with prefix as revoked, returning how many matched. The owner scope
+// guarantees a user can only revoke their own tokens. The caller decides how to
+// treat 0 (not found) vs >1 (ambiguous prefix).
+func (s *Store) RevokeAgentTokenByPrefix(ctx context.Context, owner, prefix string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+        UPDATE agent_tokens SET revoked = 1
+        WHERE owner_login = ? AND revoked = 0 AND token_hash LIKE ? || '%'`,
+		owner, prefix)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite revoke agent token: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func scanAgent(sc scanner) (*models.Agent, error) {
+	var (
+		a                    models.Agent
+		createdRaw, lastSeen string
+		revoked              int
+	)
+	if err := sc.Scan(&a.AgentID, &a.OwnerLogin, &a.Label, &a.Provider, &createdRaw, &lastSeen, &revoked); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("sqlite scan agent: %w", err)
+	}
+	created, err := time.Parse(time.RFC3339Nano, createdRaw)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite parse agent created_at %q: %w", createdRaw, err)
+	}
+	seen, err := time.Parse(time.RFC3339Nano, lastSeen)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite parse agent last_seen_at %q: %w", lastSeen, err)
+	}
+	a.CreatedAt = created
+	a.LastSeenAt = seen
+	a.Revoked = revoked != 0
+	return &a, nil
+}
+
+func scanAgentToken(sc scanner) (*models.AgentToken, error) {
+	var (
+		t          models.AgentToken
+		createdRaw string
+		lastUsed   string
+		revoked    int
+	)
+	if err := sc.Scan(&t.TokenHash, &t.OwnerLogin, &t.Note, &createdRaw, &lastUsed, &revoked); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("sqlite scan agent token: %w", err)
+	}
+	created, err := time.Parse(time.RFC3339Nano, createdRaw)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite parse agent token created_at %q: %w", createdRaw, err)
+	}
+	t.CreatedAt = created
+	t.Revoked = revoked != 0
+	t.HashPrefix = tokenHashPrefix(t.TokenHash)
+	if lastUsed != "" {
+		ts, err := time.Parse(time.RFC3339Nano, lastUsed)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite parse agent token last_used_at %q: %w", lastUsed, err)
+		}
+		t.LastUsedAt = &ts
+	}
+	return &t, nil
+}
+
+// tokenHashPrefix returns the public short handle for a token hash: the first
+// 12 hex chars. Long enough that accidental collisions are vanishingly rare,
+// short enough to be a convenient handle in the UI and revoke API.
+func tokenHashPrefix(hash string) string {
+	const n = 12
+	if len(hash) <= n {
+		return hash
+	}
+	return hash[:n]
+}

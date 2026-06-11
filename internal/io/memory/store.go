@@ -30,6 +30,11 @@ type Store struct {
 	// mirroring SQLite's AUTOINCREMENT, so MessageQuery.SinceSeq works.
 	seq    int64
 	msgSeq map[string]int64
+	// agents / agentTokens mirror the SQLite agent-binding tables. Created
+	// lazily (see ensureAgentMaps) so this optional feature stays out of the
+	// hot NewStore path.
+	agents      map[string]models.Agent
+	agentTokens map[string]models.AgentToken
 }
 
 func NewStore() *Store {
