@@ -201,6 +201,52 @@ func (s *Store) RevokeAgentTokenByPrefix(ctx context.Context, owner, prefix stri
 	return 1, nil
 }
 
+// AddAgentRoom records that agentID should be in roomID (desired state).
+// Idempotent: inserting a duplicate row is silently ignored.
+func (s *Store) AddAgentRoom(ctx context.Context, agentID, roomID, addedBy string) error {
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO agent_rooms (agent_id, room_id, added_by, added_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(agent_id, room_id) DO NOTHING`,
+		agentID, roomID, addedBy, time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite add agent room: %w", err)
+	}
+	return nil
+}
+
+// RemoveAgentRoom removes the desired-state entry for agentID/roomID.
+// No error if the row does not exist.
+func (s *Store) RemoveAgentRoom(ctx context.Context, agentID, roomID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_rooms WHERE agent_id = ? AND room_id = ?`, agentID, roomID)
+	if err != nil {
+		return fmt.Errorf("sqlite remove agent room: %w", err)
+	}
+	return nil
+}
+
+// ListAgentRooms returns the desired room_id list for an agent.
+func (s *Store) ListAgentRooms(ctx context.Context, agentID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT room_id FROM agent_rooms WHERE agent_id = ? ORDER BY added_at`, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list agent rooms: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, fmt.Errorf("sqlite scan agent room: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite list agent rooms rows: %w", err)
+	}
+	return out, nil
+}
+
 func scanAgent(sc scanner) (*models.Agent, error) {
 	var (
 		a                    models.Agent

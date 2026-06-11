@@ -36,6 +36,8 @@ type Store struct {
 	agents       map[string]models.Agent
 	agentTokens  map[string]models.AgentToken
 	agentConfigs map[string]models.AgentConfig
+	// agentRooms mirrors agent_rooms: agent_id -> set of room_ids (desired state).
+	agentRooms map[string]map[string]struct{}
 }
 
 func NewStore() *Store {

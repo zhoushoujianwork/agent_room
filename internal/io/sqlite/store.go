@@ -108,6 +108,14 @@ func migrate(db *sql.DB) error {
             updated_at     TEXT NOT NULL,
             updated_by     TEXT NOT NULL DEFAULT ''
         );`,
+		`CREATE TABLE IF NOT EXISTS agent_rooms (
+            agent_id TEXT NOT NULL,
+            room_id  TEXT NOT NULL,
+            added_by TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (agent_id, room_id)
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_rooms_room ON agent_rooms(room_id);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

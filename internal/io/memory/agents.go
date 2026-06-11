@@ -183,3 +183,40 @@ func (s *Store) RevokeAgentTokenByPrefix(_ context.Context, owner, prefix string
 func sortAgents(agents []models.Agent) {
 	sort.Slice(agents, func(i, j int) bool { return agents[i].LastSeenAt.After(agents[j].LastSeenAt) })
 }
+
+// AddAgentRoom records that agentID should be in roomID (desired state). Idempotent.
+func (s *Store) AddAgentRoom(_ context.Context, agentID, roomID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.agentRooms == nil {
+		s.agentRooms = make(map[string]map[string]struct{})
+	}
+	if s.agentRooms[agentID] == nil {
+		s.agentRooms[agentID] = make(map[string]struct{})
+	}
+	s.agentRooms[agentID][roomID] = struct{}{}
+	return nil
+}
+
+// RemoveAgentRoom removes roomID from agentID's desired state. No error if not found.
+func (s *Store) RemoveAgentRoom(_ context.Context, agentID, roomID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.agentRooms != nil {
+		delete(s.agentRooms[agentID], roomID)
+	}
+	return nil
+}
+
+// ListAgentRooms returns the desired room list for an agent.
+func (s *Store) ListAgentRooms(_ context.Context, agentID string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	set := s.agentRooms[agentID]
+	out := make([]string, 0, len(set))
+	for r := range set {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out, nil
+}

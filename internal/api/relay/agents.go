@@ -36,6 +36,10 @@ type AgentStore interface {
 
 	GetAgentConfig(ctx context.Context, agentID string) (*models.AgentConfig, error)
 	UpsertAgentConfig(ctx context.Context, cfg models.AgentConfig) error
+
+	AddAgentRoom(ctx context.Context, agentID, roomID, addedBy string) error
+	RemoveAgentRoom(ctx context.Context, agentID, roomID string) error
+	ListAgentRooms(ctx context.Context, agentID string) ([]string, error)
 }
 
 // agentTokenBytes is the random-token size in bytes before base64url encoding.

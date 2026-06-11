@@ -119,6 +119,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/agents", s.handleAgentsList)
 	mux.HandleFunc("/v1/agents/tokens", s.handleAgentTokens)
 	mux.HandleFunc("/v1/agents/tokens/", s.handleAgentTokenItem)
+	mux.HandleFunc("/v1/agents/ws", s.handleAgentCtrlWS)
 	mux.HandleFunc("/v1/agents/", s.handleAgentItem)
 	mux.HandleFunc("/v1/rooms", s.handleCreateRoom)
 	mux.HandleFunc("/v1/rooms/", s.handleRoom)
@@ -502,6 +503,12 @@ func (s *Server) handleRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// /v1/rooms/:id/agents[/:agentID]
+	if roomID, agentID, ok := parseRoomAgentsPath(r.URL.Path); ok {
+		s.handleRoomAgents(w, r, roomID, agentID)
+		return
+	}
+
 	roomID, action, ok := parseRoomPath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown route")
@@ -535,6 +542,26 @@ func parseRoomOnlyPath(path string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+// parseRoomAgentsPath matches /v1/rooms/:id/agents and /v1/rooms/:id/agents/:agentID.
+// Returns (roomID, agentID, true); agentID is "" for the collection endpoint.
+func parseRoomAgentsPath(path string) (string, string, bool) {
+	rest := strings.TrimPrefix(path, "/v1/rooms/")
+	if rest == path {
+		return "", "", false
+	}
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) < 2 || parts[1] != "agents" || parts[0] == "" {
+		return "", "", false
+	}
+	if len(parts) == 2 {
+		return parts[0], "", true
+	}
+	if len(parts) == 3 && parts[2] != "" {
+		return parts[0], parts[2], true
+	}
+	return "", "", false
 }
 
 // parseAccessRequestPath matches /v1/rooms/:id/access-requests
@@ -700,6 +727,9 @@ type hub struct {
 	secretKey []byte
 	mu        sync.RWMutex
 	rooms     map[string]map[*client]struct{}
+	// agentCtrl holds agent-level control connections: agentID -> set of clients.
+	// A control connection is not bound to any room (roomID="") and is not in h.rooms.
+	agentCtrl map[string]map[*client]struct{}
 	// execTokens maps roomID -> executor agent id -> exec_token. The relay is
 	// the sole keeper of these tokens: an executor reports its token in its
 	// presence message, the relay records it here (never storing or
@@ -717,6 +747,7 @@ func newHub(service *chat.Service, logger *slog.Logger) *hub {
 		service:    service,
 		logger:     logger,
 		rooms:      make(map[string]map[*client]struct{}),
+		agentCtrl:  make(map[string]map[*client]struct{}),
 		execTokens: make(map[string]map[string]string),
 	}
 }
@@ -724,6 +755,15 @@ func newHub(service *chat.Service, logger *slog.Logger) *hub {
 func (h *hub) register(c *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if c.ctrl {
+		agentID := c.participant.ID
+		if h.agentCtrl[agentID] == nil {
+			h.agentCtrl[agentID] = make(map[*client]struct{})
+		}
+		h.agentCtrl[agentID][c] = struct{}{}
+		h.logger.Info("agent ctrl connection registered", slog.String("agent_id", agentID))
+		return
+	}
 	if h.rooms[c.roomID] == nil {
 		h.rooms[c.roomID] = make(map[*client]struct{})
 	}
@@ -734,6 +774,18 @@ func (h *hub) register(c *client) {
 func (h *hub) unregister(c *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if c.ctrl {
+		agentID := c.participant.ID
+		if set := h.agentCtrl[agentID]; set != nil {
+			delete(set, c)
+			close(c.send)
+			if len(set) == 0 {
+				delete(h.agentCtrl, agentID)
+			}
+		}
+		h.logger.Info("agent ctrl connection unregistered", slog.String("agent_id", agentID))
+		return
+	}
 	if clients := h.rooms[c.roomID]; clients != nil {
 		delete(clients, c)
 		close(c.send)
@@ -1176,6 +1228,9 @@ type client struct {
 	send        chan outgoing
 	participant models.Participant
 	audit       bool
+	// ctrl marks this as an agent-level control connection (not bound to a room).
+	// When true, roomID is always "".
+	ctrl bool
 	// owner is the GitHub login this connection's agent token resolved to at
 	// handshake; empty for anonymous connections. It is server-derived and
 	// authoritative — clients can never set their own owner_login via metadata.
