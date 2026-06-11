@@ -3,6 +3,7 @@ import type {
   AccessRequest,
   AdminUsersReport,
   Agent,
+  AgentConfig,
   AgentToken,
   AttachmentUpload,
   ChatMessage,
@@ -27,7 +28,20 @@ async function sendJSON<T>(path: string, method: string, body?: unknown): Promis
     headers: { "Content-Type": "application/json" },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${path} ${method} → ${res.status}`);
+  if (!res.ok) {
+    // 透传服务端 {"error": "..."} 文案（如 400 的 AGENT_ROOM_SECRET_KEY 未配置提示），
+    // 拿不到时退回纯状态码。既有调用方仍只读 message，行为向后兼容。
+    let detail = "";
+    try {
+      const data = (await res.json()) as { error?: string };
+      if (data && typeof data.error === "string") detail = data.error;
+    } catch {
+      // 非 JSON 响应体，保持状态码兜底
+    }
+    throw new Error(
+      detail ? `${path} ${method} → ${res.status}: ${detail}` : `${path} ${method} → ${res.status}`,
+    );
+  }
   return res.json() as Promise<T>;
 }
 
@@ -213,6 +227,26 @@ export async function revokeAgentToken(hashPrefix: string): Promise<void> {
     credentials: "same-origin",
   });
   if (!res.ok) throw new Error(`revoke token → ${res.status}`);
+}
+
+// getAgentConfig 读取 agent 启动配置；未保存过时后端返回同形空对象。
+export async function getAgentConfig(agentID: string): Promise<AgentConfig> {
+  return getJSON<AgentConfig>(
+    `/v1/agents/${encodeURIComponent(agentID)}/config`,
+  );
+}
+
+// putAgentConfig 部分更新：键缺席=保持，api_key 传空串=清除已存 key。
+// 返回与 GET 同形的最新脱敏视图。
+export async function putAgentConfig(
+  agentID: string,
+  patch: { model?: string; api_base_url?: string; api_key?: string },
+): Promise<AgentConfig> {
+  return sendJSON<AgentConfig>(
+    `/v1/agents/${encodeURIComponent(agentID)}/config`,
+    "PUT",
+    patch,
+  );
 }
 
 /* ── access requests ─────────────────────────────────────────────── */

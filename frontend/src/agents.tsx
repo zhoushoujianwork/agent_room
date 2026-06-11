@@ -7,11 +7,13 @@ import { copyText, relativeAge, shortRoomID } from "./lib";
 import {
   createAgentToken,
   deleteAgent,
+  getAgentConfig,
   listAgents,
   listAgentTokens,
+  putAgentConfig,
   revokeAgentToken,
 } from "./api";
-import type { Agent, AgentToken, CreatedAgentToken } from "./types";
+import type { Agent, AgentConfig, AgentToken, CreatedAgentToken } from "./types";
 
 interface AgentsPageProps {
   isAdmin: boolean;
@@ -254,7 +256,7 @@ function AgentsList({
 
               {expanded === agent.agent_id && (
                 <div className="agent-mgr-config">
-                  <AgentConfigPlaceholder />
+                  <AgentConfigForm agentId={agent.agent_id} />
                 </div>
               )}
             </li>
@@ -265,33 +267,197 @@ function AgentsList({
   );
 }
 
-// AgentConfigPlaceholder 是配置编辑区的占位。后端配置 API（model /
-// api_base_url / api_key 的 GET 回显与 PUT 保存，见 issue #3）尚未落地，因此这里
-// 先以禁用态展示规划中的字段，避免实现者自由发挥，也让用户知道功能即将上线。
-function AgentConfigPlaceholder() {
-  return (
-    <div className="agent-config-soon" aria-label="配置编辑（即将上线）">
-      <div className="agent-config-soon-head">
-        <Icon name="settings" size={14} />
-        <strong>配置编辑即将上线</strong>
-        <span className="chip chip-mono">依赖 #3</span>
+// MODEL_SUGGESTIONS 仅作为 <datalist> 建议项，用户可自由输入任意自定义模型名。
+const MODEL_SUGGESTIONS = ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"];
+
+// AgentConfigForm 对接 GET/PUT /v1/agents/{id}/config：挂载即加载已存配置，
+// 编辑后部分更新（字段缺席=保持，api_key 空串=清除）。安全红线：api_key 输入值
+// 绝不写入 console / localStorage，也不在 DOM 上明文回显——仅展示后端脱敏串。
+function AgentConfigForm({ agentId }: { agentId: string }) {
+  const [config, setConfig] = useState<AgentConfig | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const [model, setModel] = useState("");
+  const [apiBaseURL, setApiBaseURL] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [clearKey, setClearKey] = useState(false);
+
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setLoadError(false);
+    getAgentConfig(agentId)
+      .then((cfg) => {
+        setConfig(cfg);
+        setModel(cfg.model || "");
+        setApiBaseURL(cfg.api_base_url || "");
+        setApiKey("");
+        setClearKey(false);
+        setFormError(null);
+        setSuccess(false);
+      })
+      .catch(() => setLoadError(true))
+      .finally(() => setLoading(false));
+  }, [agentId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const save = useCallback(() => {
+    const trimmedBase = apiBaseURL.trim();
+    if (trimmedBase && !/^https?:\/\//i.test(trimmedBase)) {
+      setSuccess(false);
+      setFormError("API 地址需以 http:// 或 https:// 开头。");
+      return;
+    }
+
+    // model / api_base_url 总是携带（存在即覆盖，空串=清空）；api_key 三态：
+    // 待清除 → 空串；输入了新值 → 携带其值；否则完全不携带（保持现有 key）。
+    const patch: { model?: string; api_base_url?: string; api_key?: string } = {
+      model: model.trim(),
+      api_base_url: trimmedBase,
+    };
+    if (clearKey) {
+      patch.api_key = "";
+    } else if (apiKey !== "") {
+      patch.api_key = apiKey;
+    }
+
+    setSaving(true);
+    setFormError(null);
+    setSuccess(false);
+    putAgentConfig(agentId, patch)
+      .then((cfg) => {
+        setConfig(cfg);
+        setModel(cfg.model || "");
+        setApiBaseURL(cfg.api_base_url || "");
+        setApiKey("");
+        setClearKey(false);
+        setSuccess(true);
+      })
+      .catch((err: unknown) => {
+        setFormError(err instanceof Error ? err.message : "保存失败，请稍后重试。");
+      })
+      .finally(() => setSaving(false));
+  }, [agentId, model, apiBaseURL, apiKey, clearKey]);
+
+  if (loading) {
+    return <p className="home-fine">加载配置…</p>;
+  }
+
+  if (loadError || !config) {
+    return (
+      <div className="agent-config-form">
+        <div className="agent-config-error" role="alert">
+          <Icon name="alert" size={14} /> 加载配置失败，可能未登录或服务暂不可用。
+        </div>
+        <button type="button" className="btn btn-sm" onClick={load}>
+          <Icon name="refresh" size={14} /> 重试
+        </button>
       </div>
-      <p className="home-fine">
-        模型与 API 凭据的在线编辑正在开发中。上线后可在此设置：
-      </p>
-      <div className="agent-config-fields" aria-hidden>
-        <label>
-          <span>模型 model</span>
-          <input type="text" placeholder="claude-sonnet-4-6" disabled />
-        </label>
-        <label>
-          <span>API 地址 api_base_url</span>
-          <input type="text" placeholder="https://api.anthropic.com" disabled />
-        </label>
-        <label>
-          <span>API Key</span>
-          <input type="password" placeholder="sk-***abcd" disabled />
-        </label>
+    );
+  }
+
+  const masked = config.api_key_masked;
+  const keyPlaceholder = clearKey
+    ? "保存后将清除"
+    : masked
+      ? `当前已设置：${masked}（输入新值覆盖）`
+      : "未设置";
+
+  return (
+    <div className="agent-config-form">
+      <div className="agent-config-form-head">
+        <Icon name="settings" size={14} />
+        <strong>Agent 启动配置</strong>
+      </div>
+
+      <label className="agent-config-field">
+        <span>模型 model</span>
+        <input
+          type="text"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          list={`model-suggestions-${agentId}`}
+          placeholder="留空使用 bridge 本地默认"
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <datalist id={`model-suggestions-${agentId}`}>
+          {MODEL_SUGGESTIONS.map((m) => (
+            <option key={m} value={m} />
+          ))}
+        </datalist>
+      </label>
+
+      <label className="agent-config-field">
+        <span>API 地址 api_base_url</span>
+        <input
+          type="text"
+          value={apiBaseURL}
+          onChange={(e) => setApiBaseURL(e.target.value)}
+          placeholder="https://…（Anthropic 兼容网关，留空走官方）"
+          spellCheck={false}
+          autoComplete="off"
+        />
+      </label>
+
+      <label className="agent-config-field">
+        <span>API Key</span>
+        <div className="agent-config-key-row">
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={keyPlaceholder}
+            disabled={clearKey}
+            autoComplete="off"
+          />
+          {clearKey ? (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setClearKey(false)}
+            >
+              取消清除
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-sm btn-danger"
+              onClick={() => {
+                setApiKey("");
+                setClearKey(true);
+              }}
+              disabled={!masked}
+              title={masked ? "保存后清除已存 Key" : "当前未设置 Key"}
+            >
+              清除已存 Key
+            </button>
+          )}
+        </div>
+      </label>
+
+      {formError && (
+        <div className="agent-config-error" role="alert">
+          <Icon name="alert" size={14} /> {formError}
+        </div>
+      )}
+      {success && (
+        <div className="agent-config-success" role="status">
+          <Icon name="check" size={14} /> 已保存。agent 在线时已即时下发，下一次生成开始生效。
+        </div>
+      )}
+
+      <div className="agent-config-form-foot">
+        <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={saving}>
+          {saving ? "保存中…" : "保存配置"}
+        </button>
       </div>
     </div>
   );
