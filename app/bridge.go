@@ -212,7 +212,13 @@ func (a *BridgeApp) runAgent(ctx context.Context) error {
 
 	// Legacy (no-token) mode: single room, no control connection. Behavior is
 	// identical to before this change.
-	engine.joinRoom(ctx, a.cfg.RoomID)
+	// registerRoom (not joinRoom) only creates the map entry without starting a
+	// connection goroutine — the dial/reconnect cycle is owned by runWithReconnect
+	// below, and serveConn drives presence + readLoop on each connection. Using
+	// joinRoom here would start runRoomConn (connection #1) while runWithReconnect
+	// simultaneously dials a second connection — causing duplicate presence and
+	// double-handling of every inbound message.
+	engine.registerRoom(ctx, a.cfg.RoomID)
 	return a.runWithReconnect(ctx, "agent", func(ctx context.Context, conn *websocket.Conn) error {
 		return engine.serveConn(ctx, conn)
 	})
