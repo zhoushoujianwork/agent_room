@@ -80,6 +80,14 @@ func (p *ClaudeProvider) ApplyServerConfig(model, apiBaseURL, apiKey string) {
 	p.srvAPIKey = apiKey
 }
 
+// RuntimeConfig reports the currently effective config without revealing the
+// API key. Used by the bridge to tell the relay what this client is actually
+// running after local defaults and server overrides are resolved.
+func (p *ClaudeProvider) RuntimeConfig() (model, apiBaseURL string, apiKeySet bool) {
+	model, apiBaseURL, apiKey := p.effectiveConfig()
+	return model, apiBaseURL, strings.TrimSpace(apiKey) != ""
+}
+
 // effectiveConfig resolves the model / base url / api key to use for this run:
 // the relay override when non-empty, else the bridge local default.
 func (p *ClaudeProvider) effectiveConfig() (model, apiBaseURL, apiKey string) {

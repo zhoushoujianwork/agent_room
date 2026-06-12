@@ -416,6 +416,10 @@ function AgentCard({
   const [confirming, setConfirming] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [removeMsg, setRemoveMsg] = useState<string | null>(null);
+  const provider = p.metadata?.provider || p.metadata?.role || "agent";
+  const version = p.metadata?.version;
+  const device = p.metadata?.device;
+  const capabilities = p.metadata?.capabilities;
 
   const handleRemove = useCallback(() => {
     setRemoving(true);
@@ -435,84 +439,98 @@ function AgentCard({
   return (
     <div className="agent-card" style={{ ["--tint" as string]: tint.solid }}>
       <div className="agent-card-top">
-        <OsAvatar
-          person={{ id: p.id, label: p.label || p.id, kind: "agent", hue }}
-          dark={dark}
-          size={40}
-          os={p.metadata?.os}
-        />
-        <div className="agent-card-id">
-          <strong style={{ color: tint.text }}>{p.label || p.id}</strong>
-          <span>{p.metadata?.role || p.metadata?.provider || ""}</span>
+        <div className="agent-card-identity">
+          <OsAvatar
+            person={{ id: p.id, label: p.label || p.id, kind: "agent", hue }}
+            dark={dark}
+            size={42}
+            os={p.metadata?.os}
+          />
+          <div className="agent-card-id">
+            <strong style={{ color: tint.text }} title={p.label || p.id}>
+              {p.label || p.id}
+            </strong>
+            <span>{provider}</span>
+          </div>
         </div>
         <ModeBadge mode={mode} full />
       </div>
       <div className="agent-meta">
+        <span className="agent-meta-item agent-live">
+          <StatusDot tone="live" pulse /> 在线 · {relativeTime(p.last_seen_at)}
+        </span>
         {os && (
-          <span className="agent-os">
+          <span className="agent-meta-item">
             <OsGlyph os={os} size={14} /> {osLabel(os)}
           </span>
         )}
-        {p.metadata?.device && (
-          <span>
-            <Icon name="cpu" size={13} /> {p.metadata.device}
+        {device && (
+          <span className="agent-meta-item" title={device}>
+            <Icon name="cpu" size={13} /> {device}
           </span>
         )}
-        {p.metadata?.version && (
-          <span className="agent-ver" title="bridge 版本">
-            v{p.metadata.version}
+        {version && (
+          <span className="agent-meta-item agent-ver" title={version}>
+            <Icon name="branch" size={13} /> v{version}
           </span>
         )}
-        <span>
-          <StatusDot tone="live" pulse /> 在线 · {relativeTime(p.last_seen_at)}
-        </span>
-        {p.metadata?.capabilities && (
-          <span className="agent-cap">{p.metadata.capabilities}</span>
+        {capabilities && (
+          <span className="agent-cap" title={capabilities}>
+            {capabilities}
+          </span>
         )}
       </div>
       <div className="agent-card-foot">
-        <code>@{p.id}</code>
         <button
           type="button"
-          className="icon-btn icon-btn-ghost"
-          title="复制 @mention"
-          aria-label="复制 @mention"
+          className="agent-mention"
+          title={`复制 @${p.id}`}
           onClick={() => onCopyMention(p.id)}
         >
-          <Icon name="copy" size={14} />
+          <code>@{p.id}</code>
+          <Icon name="copy" size={13} />
         </button>
-      </div>
-      {isOwn && (
-        <div className="agent-card-remove">
-          {confirming ? (
-            <span className="agent-mgr-confirm">
-              <button
-                type="button"
-                className="btn btn-sm btn-danger"
-                onClick={handleRemove}
-                disabled={removing}
-              >
-                {removing ? "移出中…" : "确认移出"}
-              </button>
+        {isOwn && (
+          <div className="agent-card-remove">
+            {confirming ? (
+              <span className="agent-remove-confirm">
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger"
+                  onClick={handleRemove}
+                  disabled={removing}
+                >
+                  {removing ? "移出中…" : "确认移出"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => setConfirming(false)}
+                  disabled={removing}
+                >
+                  取消
+                </button>
+              </span>
+            ) : (
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => setConfirming(false)}
-                disabled={removing}
+                onClick={() => setConfirming(true)}
               >
-                取消
+                <Icon name="x" size={13} /> 移出本房间
               </button>
-            </span>
-          ) : (
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => setConfirming(true)}
-            >
-              <Icon name="x" size={13} /> 移出本房间
-            </button>
-          )}
-          {removeMsg && <span className="agent-join-msg">{removeMsg}</span>}
+            )}
+          </div>
+        )}
+      </div>
+      {isOwn && removeMsg && (
+        <div className="agent-card-message">
+          <span className="agent-join-msg">{removeMsg}</span>
+        </div>
+      )}
+      {!isOwn && (
+        <div className="agent-card-view-only">
+          <Icon name="lock" size={12} /> 仅 Agent 所有人可移出
         </div>
       )}
     </div>
@@ -535,15 +553,24 @@ function JoinMyAgentSection({
 
   useEffect(() => {
     if (!currentLogin) return;
-    listAgents()
+    let cancelled = false;
+    const refresh = () => listAgents()
       .then((list) => {
+        if (cancelled) return;
         setMyAgents(list);
         setLoaded(true);
       })
       .catch(() => {
+        if (cancelled) return;
         // 静默失败：房间页不打扰
         setLoaded(false);
       });
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [currentLogin]);
 
   if (!currentLogin || !loaded) return null;

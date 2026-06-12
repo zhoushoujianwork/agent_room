@@ -158,6 +158,11 @@ export interface AgentConfig {
   api_key_masked: string;
   updated_at?: string;
   updated_by?: string;
+  runtime_provider?: string;
+  runtime_model?: string;
+  runtime_api_base_url?: string;
+  runtime_api_key_set?: boolean;
+  runtime_updated_at?: string;
 }
 
 /* ── Room summary (LLM 滚动摘要) ─────────────────────────────────── */

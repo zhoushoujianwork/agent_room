@@ -35,6 +35,10 @@ const (
 	// logging. The bridge applies it to its provider's in-memory runtime
 	// config; an empty field means "fall back to the bridge local default".
 	ControlOperationConfigUpdate = "config_update"
+	// ControlOperationConfigReport is sent by the bridge over the control
+	// connection to report the currently effective provider config. It never
+	// includes plaintext secrets; metadata["api_key_set"] is a boolean string.
+	ControlOperationConfigReport = "config_report"
 
 	// ControlOperationJoinRoom is sent by the relay over the control connection
 	// to instruct the bridge to join (or remain in) a given room.

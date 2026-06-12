@@ -132,6 +132,8 @@ function AgentsList({
 
   useEffect(() => {
     refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   const unbind = useCallback(
@@ -371,12 +373,28 @@ function AgentConfigForm({ agentId }: { agentId: string }) {
     : masked
       ? `当前已设置：${masked}（输入新值覆盖）`
       : "未设置";
+  const hasRuntimeReport = Boolean(config.runtime_updated_at);
 
   return (
     <div className="agent-config-form">
       <div className="agent-config-form-head">
         <Icon name="settings" size={14} />
         <strong>Agent 启动配置</strong>
+      </div>
+      <div className="agent-runtime-config">
+        <span className="agent-runtime-title">
+          <Icon name="activity" size={13} /> 当前运行
+        </span>
+        {hasRuntimeReport ? (
+          <div className="agent-runtime-grid">
+            <span>provider: {config.runtime_provider || "unknown"}</span>
+            <span>model: {config.runtime_model || "bridge 默认"}</span>
+            <span>api: {config.runtime_api_base_url || "默认官方入口"}</span>
+            <span>key: {config.runtime_api_key_set ? "已注入" : "未注入"}</span>
+          </div>
+        ) : (
+          <span className="agent-runtime-empty">等待在线 bridge 上报当前配置…</span>
+        )}
       </div>
 
       <label className="agent-config-field">

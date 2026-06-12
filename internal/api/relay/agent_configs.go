@@ -16,11 +16,16 @@ import (
 // agentConfigResponse is the GET payload: never the ciphertext or plaintext
 // key, only a masked rendering so an owner can confirm which key is set.
 type agentConfigResponse struct {
-	Model        string    `json:"model"`
-	APIBaseURL   string    `json:"api_base_url"`
-	APIKeyMasked string    `json:"api_key_masked"`
-	UpdatedAt    time.Time `json:"updated_at,omitempty"`
-	UpdatedBy    string    `json:"updated_by,omitempty"`
+	Model             string    `json:"model"`
+	APIBaseURL        string    `json:"api_base_url"`
+	APIKeyMasked      string    `json:"api_key_masked"`
+	UpdatedAt         time.Time `json:"updated_at,omitempty"`
+	UpdatedBy         string    `json:"updated_by,omitempty"`
+	RuntimeProvider   string    `json:"runtime_provider,omitempty"`
+	RuntimeModel      string    `json:"runtime_model,omitempty"`
+	RuntimeAPIBaseURL string    `json:"runtime_api_base_url,omitempty"`
+	RuntimeAPIKeySet  bool      `json:"runtime_api_key_set,omitempty"`
+	RuntimeUpdatedAt  time.Time `json:"runtime_updated_at,omitempty"`
 }
 
 // agentConfigUpdate is the PUT body. Pointer fields distinguish "absent (keep
@@ -30,10 +35,18 @@ type agentConfigResponse struct {
 // request is rejected with 409 if the stored updated_at does not match,
 // preventing silent last-write-wins overwrites in concurrent-edit scenarios.
 type agentConfigUpdate struct {
-	Model          *string    `json:"model"`
-	APIBaseURL     *string    `json:"api_base_url"`
-	APIKey         *string    `json:"api_key"`
+	Model           *string    `json:"model"`
+	APIBaseURL      *string    `json:"api_base_url"`
+	APIKey          *string    `json:"api_key"`
 	ExpectUpdatedAt *time.Time `json:"expect_updated_at,omitempty"`
+}
+
+type agentRuntimeConfig struct {
+	Provider   string
+	Model      string
+	APIBaseURL string
+	APIKeySet  bool
+	UpdatedAt  time.Time
 }
 
 // handleAgentConfig serves GET/PUT /v1/agents/{agent_id}/config. Owner-or-admin
@@ -73,14 +86,19 @@ func (s *Server) getAgentConfig(w http.ResponseWriter, r *http.Request, agentID 
 	if err != nil {
 		if isNotFound(err) {
 			// No config saved yet: return an empty, non-error shape.
-			writeJSON(w, http.StatusOK, agentConfigResponse{})
+			writeJSON(w, http.StatusOK, s.agentConfigResponse(agentID, nil))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, s.agentConfigResponse(agentID, cfg))
+}
+
+func (s *Server) agentConfigResponse(agentID string, cfg *models.AgentConfig) agentConfigResponse {
 	masked := ""
-	if strings.TrimSpace(cfg.APIKeyCipher) != "" {
+	resp := agentConfigResponse{}
+	if cfg != nil && strings.TrimSpace(cfg.APIKeyCipher) != "" {
 		// Decrypt only to mask; the plaintext never leaves this function.
 		if plain, derr := decryptSecret(s.hub.secretKey, cfg.APIKeyCipher); derr == nil {
 			masked = maskAPIKey(plain)
@@ -88,13 +106,21 @@ func (s *Server) getAgentConfig(w http.ResponseWriter, r *http.Request, agentID 
 			masked = "***"
 		}
 	}
-	writeJSON(w, http.StatusOK, agentConfigResponse{
-		Model:        cfg.Model,
-		APIBaseURL:   cfg.APIBaseURL,
-		APIKeyMasked: masked,
-		UpdatedAt:    cfg.UpdatedAt,
-		UpdatedBy:    cfg.UpdatedBy,
-	})
+	if cfg != nil {
+		resp.Model = cfg.Model
+		resp.APIBaseURL = cfg.APIBaseURL
+		resp.APIKeyMasked = masked
+		resp.UpdatedAt = cfg.UpdatedAt
+		resp.UpdatedBy = cfg.UpdatedBy
+	}
+	if runtimeCfg, ok := s.hub.agentRuntimeConfig(agentID); ok {
+		resp.RuntimeProvider = runtimeCfg.Provider
+		resp.RuntimeModel = runtimeCfg.Model
+		resp.RuntimeAPIBaseURL = runtimeCfg.APIBaseURL
+		resp.RuntimeAPIKeySet = runtimeCfg.APIKeySet
+		resp.RuntimeUpdatedAt = runtimeCfg.UpdatedAt
+	}
+	return resp
 }
 
 func (s *Server) putAgentConfig(w http.ResponseWriter, r *http.Request, agentID, login string) {
@@ -174,21 +200,37 @@ func (s *Server) putAgentConfig(w http.ResponseWriter, r *http.Request, agentID,
 	s.hub.sendConfigUpdate(agentID, next)
 
 	// Echo back the masked view (same shape as GET) so the client can refresh.
-	masked := ""
-	if strings.TrimSpace(next.APIKeyCipher) != "" {
-		if plain, derr := decryptSecret(s.hub.secretKey, next.APIKeyCipher); derr == nil {
-			masked = maskAPIKey(plain)
-		} else {
-			masked = "***"
-		}
+	writeJSON(w, http.StatusOK, s.agentConfigResponse(agentID, &next))
+}
+
+func (h *hub) updateAgentRuntimeConfig(agentID string, metadata map[string]string) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return
 	}
-	writeJSON(w, http.StatusOK, agentConfigResponse{
-		Model:        next.Model,
-		APIBaseURL:   next.APIBaseURL,
-		APIKeyMasked: masked,
-		UpdatedAt:    next.UpdatedAt,
-		UpdatedBy:    next.UpdatedBy,
-	})
+	cfg := agentRuntimeConfig{
+		Provider:   strings.TrimSpace(metadata["provider"]),
+		Model:      strings.TrimSpace(metadata["model"]),
+		APIBaseURL: strings.TrimSpace(metadata["api_base_url"]),
+		APIKeySet:  strings.EqualFold(strings.TrimSpace(metadata["api_key_set"]), "true"),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	h.mu.Lock()
+	h.agentRuntime[agentID] = cfg
+	h.mu.Unlock()
+	h.logger.Info("agent config report received",
+		slog.String("agent_id", agentID),
+		slog.String("provider", cfg.Provider),
+		slog.String("model", cfg.Model),
+		slog.String("api_base_url", cfg.APIBaseURL),
+		slog.Bool("api_key_set", cfg.APIKeySet))
+}
+
+func (h *hub) agentRuntimeConfig(agentID string) (agentRuntimeConfig, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	cfg, ok := h.agentRuntime[agentID]
+	return cfg, ok
 }
 
 // --- downstream delivery (relay -> bridge) ---

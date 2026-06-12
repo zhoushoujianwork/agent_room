@@ -324,6 +324,12 @@ func (h *hub) AgentPresence() map[string]agentPresence {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	roomSets := make(map[string]map[string]struct{})
+	online := make(map[string]struct{})
+	for agentID := range h.agentCtrl {
+		if strings.TrimSpace(agentID) != "" {
+			online[agentID] = struct{}{}
+		}
+	}
 	for roomID, clients := range h.rooms {
 		for c := range clients {
 			if c.audit {
@@ -337,14 +343,16 @@ func (h *hub) AgentPresence() map[string]agentPresence {
 			if id == "" {
 				continue
 			}
+			online[id] = struct{}{}
 			if roomSets[id] == nil {
 				roomSets[id] = make(map[string]struct{})
 			}
 			roomSets[id][roomID] = struct{}{}
 		}
 	}
-	out := make(map[string]agentPresence, len(roomSets))
-	for id, rooms := range roomSets {
+	out := make(map[string]agentPresence, len(online))
+	for id := range online {
+		rooms := roomSets[id]
 		list := make([]string, 0, len(rooms))
 		for roomID := range rooms {
 			list = append(list, roomID)

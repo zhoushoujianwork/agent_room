@@ -160,9 +160,8 @@ func (h *hub) sendLeaveRoom(agentID, roomID string) {
 	h.sendToAgentCtrl(agentID, msg)
 }
 
-// ctrlReadLoop reads messages from a control connection. Only room_state_report
-// is processed; all other messages are silently discarded. Nothing is ever
-// written to message history from this loop.
+// ctrlReadLoop reads messages from a control connection. It accepts lightweight
+// reports from the bridge and never writes them to room history.
 func (c *client) ctrlReadLoop(ctx context.Context, s *Server) {
 	defer func() {
 		c.hub.unregister(c)
@@ -188,6 +187,10 @@ func (c *client) ctrlReadLoop(ctx context.Context, s *Server) {
 		_ = c.conn.SetReadDeadline(time.Now().Add(clientPongWait))
 
 		op := strings.TrimSpace(msg.Metadata["operation"])
+		if op == models.ControlOperationConfigReport {
+			c.hub.updateAgentRuntimeConfig(agentID, msg.Metadata)
+			continue
+		}
 		if op != models.ControlOperationRoomStateReport {
 			c.hub.logger.Debug("ctrl ignoring non-report message",
 				slog.String("agent_id", agentID), slog.String("operation", op))

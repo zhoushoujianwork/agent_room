@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -9,7 +10,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import type { AccessRequest, ChatMessage, Participant, Room } from "./types";
+import type { AccessRequest, Agent, ChatMessage, Participant, Room } from "./types";
 import { Icon, OsGlyph } from "./icons";
 import { Avatar, BrandMark, Chip, ModeBadge, OsAvatar, SignInPill, StatusDot } from "./ui";
 import {
@@ -21,6 +22,7 @@ import {
 } from "./lib";
 import { useAuth } from "./auth";
 import { UserMenu, detectQuickStartOS, type RoomRecord } from "./home";
+import { joinAgentToRoom, listAgents } from "./api";
 
 /* ── Sidebar ──────────────────────────────────────────────────────── */
 
@@ -61,6 +63,7 @@ export function RoomSidebar({
   const authEnabled = me.auth_enabled;
   const agents = participants.filter((p) => p.kind === "agent");
   const users = participants.filter((p) => p.kind === "user");
+  const [agentPickerOpen, setAgentPickerOpen] = useState(false);
 
   return (
     <aside className="sidebar">
@@ -106,8 +109,28 @@ export function RoomSidebar({
           <span>
             <Icon name="cpu" size={14} /> Bridges
           </span>
-          <Chip tone="mono">{agents.length}</Chip>
+          <span className="side-head-actions">
+            {me.authenticated && (
+              <button
+                type="button"
+                className="side-add-agent"
+                title="加入我的 Agent"
+                aria-label="加入我的 Agent"
+                onClick={() => setAgentPickerOpen((open) => !open)}
+              >
+                <Icon name="plus" size={13} />
+              </button>
+            )}
+            <Chip tone="mono">{agents.length}</Chip>
+          </span>
         </div>
+        {agentPickerOpen && me.authenticated && (
+          <SidebarAgentPicker
+            roomID={roomID}
+            participants={participants}
+            currentLogin={me.user.login}
+          />
+        )}
         <div className="side-people">
           {agents.length === 0 ? (
             <div className="side-empty">暂无 Bridge 在线</div>
@@ -221,6 +244,117 @@ function BridgeDownloadSection({ roomID }: { roomID: string }) {
         </p>
       </div>
     </section>
+  );
+}
+
+function SidebarAgentPicker({
+  roomID,
+  participants,
+  currentLogin,
+}: {
+  roomID: string;
+  participants: Participant[];
+  currentLogin: string;
+}) {
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [joining, setJoining] = useState<string | null>(null);
+  const [notice, setNotice] = useState("");
+  const joinedIDs = useMemo(
+    () => new Set(participants.filter((p) => p.kind === "agent").map((p) => p.id)),
+    [participants],
+  );
+
+  const refresh = useCallback(async () => {
+    try {
+      const rows = await listAgents();
+      setAgents(
+        rows
+          .filter((a) => !a.revoked && (!a.owner_login || a.owner_login === currentLogin))
+          .sort((a, b) => Number(b.online) - Number(a.online) || a.agent_id.localeCompare(b.agent_id)),
+      );
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载 agent 失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [currentLogin]);
+
+  useEffect(() => {
+    let alive = true;
+    async function tick() {
+      if (!alive) return;
+      await refresh();
+    }
+    tick();
+    const timer = window.setInterval(tick, 3000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [refresh]);
+
+  async function join(agent: Agent) {
+    if (joining || joinedIDs.has(agent.agent_id) || agent.rooms?.includes(roomID)) return;
+    setJoining(agent.agent_id);
+    setNotice("");
+    try {
+      const res = await joinAgentToRoom(roomID, agent.agent_id);
+      setNotice(res.delivered ? "已发送加入指令" : "已保存，agent 上线后会加入");
+      await refresh();
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : "加入失败");
+    } finally {
+      setJoining(null);
+    }
+  }
+
+  return (
+    <div className="side-agent-picker">
+      <div className="side-agent-picker-head">
+        <span>我的 Agent</span>
+        <button type="button" onClick={refresh} title="刷新" aria-label="刷新">
+          <Icon name="refresh" size={12} />
+        </button>
+      </div>
+      {loading ? (
+        <div className="side-agent-empty">加载中...</div>
+      ) : error ? (
+        <div className="side-agent-empty">{error}</div>
+      ) : agents.length === 0 ? (
+        <div className="side-agent-empty">还没有注册的 Agent</div>
+      ) : (
+        <div className="side-agent-list">
+          {agents.map((agent) => {
+            const joined = joinedIDs.has(agent.agent_id) || agent.rooms?.includes(roomID);
+            return (
+              <div className="side-agent-row" key={agent.agent_id}>
+                <span className="side-agent-live">
+                  <StatusDot tone={agent.online ? "live" : "off"} pulse={agent.online} size={7} />
+                </span>
+                <span className="side-agent-main">
+                  <strong title={agent.agent_id}>{agent.label || agent.agent_id}</strong>
+                  <span>
+                    {agent.online ? "在线" : "离线"} · {agent.provider || "agent"}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className={joined ? "side-agent-join is-joined" : "side-agent-join"}
+                  disabled={joined || joining === agent.agent_id}
+                  onClick={() => join(agent)}
+                >
+                  {joined ? "已加入" : joining === agent.agent_id ? "加入中" : "加入"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {notice && <div className="side-agent-notice">{notice}</div>}
+    </div>
   );
 }
 

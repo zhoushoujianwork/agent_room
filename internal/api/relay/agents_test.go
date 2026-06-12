@@ -204,6 +204,36 @@ func TestWSHandshakeBindsOwnerAndRejectsBadToken(t *testing.T) {
 	}
 }
 
+func TestAgentControlConnectionCountsAsOnline(t *testing.T) {
+	s := newAdminServer(t, agentTestSecret, "root")
+	token, _ := createTokenForUser(t, s, "alice")
+
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsBase+"/v1/agents/ws?agent_token="+token+"&client_id=agent-ctrl-only&client_label=Desk%20Agent&provider=claude", nil)
+	if err != nil {
+		t.Fatalf("control ws failed: %v", err)
+	}
+	defer conn.Close()
+
+	var listed []models.Agent
+	for range 50 {
+		listed = getAgents(t, s, "alice")
+		if len(listed) == 1 && listed[0].Online {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("agents = %+v, want one bound agent", listed)
+	}
+	if got := listed[0]; !got.Online || len(got.Rooms) != 0 {
+		t.Fatalf("agent presence = online %v rooms %#v, want online with no rooms", got.Online, got.Rooms)
+	}
+}
+
 func getAgents(t *testing.T, s *Server, login string) []models.Agent {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v1/agents", nil)

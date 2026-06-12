@@ -367,6 +367,7 @@ func (e *agentEngine) runControlConn(ctx context.Context) {
 
 		// Report current rooms right after connect.
 		e.sendRoomStateReport()
+		e.sendConfigReport()
 
 		// Control read loop.
 		e.readControlLoop(ctx, conn)
@@ -435,10 +436,6 @@ func (e *agentEngine) readControlLoop(ctx context.Context, conn *websocket.Conn)
 			e.sendRoomStateReport()
 
 		case models.ControlOperationConfigUpdate:
-			// Strip api_key before any storage; control conn msgs don't go to chat store.
-			if strings.TrimSpace(msg.Metadata["api_key"]) != "" {
-				msg.Metadata = copyMetadataWithout(msg.Metadata, "api_key")
-			}
 			e.applyConfigUpdate(msg)
 
 		default:
@@ -774,6 +771,40 @@ type runtimeConfigurable interface {
 	ApplyServerConfig(model, apiBaseURL, apiKey string)
 }
 
+// runtimeConfigReporter is implemented by providers that can report the
+// currently effective runtime config without exposing secret material.
+type runtimeConfigReporter interface {
+	RuntimeConfig() (model, apiBaseURL string, apiKeySet bool)
+}
+
+// sendConfigReport tells the relay which runtime config this bridge is
+// actually using. It never sends plaintext keys; only api_key_set is reported.
+func (e *agentEngine) sendConfigReport() {
+	reporter, ok := e.provider.(runtimeConfigReporter)
+	if !ok {
+		return
+	}
+	model, apiBaseURL, apiKeySet := reporter.RuntimeConfig()
+	msg := models.ChatMessage{
+		Type:       models.MessageTypeControl,
+		SenderID:   e.app.cfg.AgentID,
+		SenderKind: models.SenderKindAgent,
+		CreatedAt:  time.Now().UTC(),
+		Metadata: map[string]string{
+			"operation":    models.ControlOperationConfigReport,
+			"provider":     e.provider.Name(),
+			"model":        model,
+			"api_base_url": apiBaseURL,
+			"api_key_set":  strconv.FormatBool(apiKeySet),
+		},
+	}
+	e.controlMu.Lock()
+	defer e.controlMu.Unlock()
+	if e.controlConn != nil {
+		_ = e.controlConn.WriteJSON(msg)
+	}
+}
+
 // applyConfigUpdate applies a relay config_update control message to the local
 // provider's in-memory runtime config.
 func (e *agentEngine) applyConfigUpdate(msg models.ChatMessage) {
@@ -792,6 +823,7 @@ func (e *agentEngine) applyConfigUpdate(msg models.ChatMessage) {
 		slog.String("model", model),
 		slog.String("api_base_url", apiBaseURL),
 		slog.Bool("api_key_set", strings.TrimSpace(apiKey) != ""))
+	e.sendConfigReport()
 }
 
 // copyMetadataWithout returns a shallow copy of metadata with the named key

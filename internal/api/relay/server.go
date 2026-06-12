@@ -730,6 +730,9 @@ type hub struct {
 	// agentCtrl holds agent-level control connections: agentID -> set of clients.
 	// A control connection is not bound to any room (roomID="") and is not in h.rooms.
 	agentCtrl map[string]map[*client]struct{}
+	// agentRuntime holds the latest non-secret runtime config reported by a
+	// connected bridge. It is an online view, not durable desired config.
+	agentRuntime map[string]agentRuntimeConfig
 	// execTokens maps roomID -> executor agent id -> exec_token. The relay is
 	// the sole keeper of these tokens: an executor reports its token in its
 	// presence message, the relay records it here (never storing or
@@ -744,11 +747,12 @@ type hub struct {
 
 func newHub(service *chat.Service, logger *slog.Logger) *hub {
 	return &hub{
-		service:    service,
-		logger:     logger,
-		rooms:      make(map[string]map[*client]struct{}),
-		agentCtrl:  make(map[string]map[*client]struct{}),
-		execTokens: make(map[string]map[string]string),
+		service:      service,
+		logger:       logger,
+		rooms:        make(map[string]map[*client]struct{}),
+		agentCtrl:    make(map[string]map[*client]struct{}),
+		agentRuntime: make(map[string]agentRuntimeConfig),
+		execTokens:   make(map[string]map[string]string),
 	}
 }
 

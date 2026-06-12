@@ -105,6 +105,60 @@ func TestAgentCtrlWS_ConfigPushedOnConnect(t *testing.T) {
 	}
 }
 
+func TestAgentCtrlWS_ConfigReportVisibleInConfig(t *testing.T) {
+	s := newConfigServer(t, agentTestSecret, "the-secret", "root")
+	ctx := context.Background()
+	_ = s.agents.UpsertAgent(ctx, models.Agent{AgentID: "agent-report-1", OwnerLogin: "alice"})
+
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	token, _ := createTokenForUser(t, s, "alice")
+	conn := dialCtrlWS(t, wsBase, token, "agent-report-1")
+	defer conn.Close()
+
+	if err := conn.WriteJSON(models.ChatMessage{
+		Type:       models.MessageTypeControl,
+		SenderID:   "agent-report-1",
+		SenderKind: models.SenderKindAgent,
+		Metadata: map[string]string{
+			"operation":    models.ControlOperationConfigReport,
+			"provider":     "claude",
+			"model":        "claude-sonnet-4-6",
+			"api_base_url": "https://gw.example/v1",
+			"api_key_set":  "true",
+		},
+	}); err != nil {
+		t.Fatalf("write config_report: %v", err)
+	}
+
+	var got agentConfigResponse
+	for range 50 {
+		req := httptest.NewRequest(http.MethodGet, "/v1/agents/agent-report-1/config", nil)
+		req.AddCookie(signedCookie(t, agentTestSecret, "alice"))
+		rr := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("get config = %d, body=%s", rr.Code, rr.Body.String())
+		}
+		if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+			t.Fatalf("decode config: %v", err)
+		}
+		if got.RuntimeUpdatedAt.IsZero() {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	if got.RuntimeProvider != "claude" ||
+		got.RuntimeModel != "claude-sonnet-4-6" ||
+		got.RuntimeAPIBaseURL != "https://gw.example/v1" ||
+		!got.RuntimeAPIKeySet {
+		t.Fatalf("runtime config = %+v", got)
+	}
+}
+
 // --- Test 2: POST join ---
 
 func TestRoomAgents_PostJoin(t *testing.T) {
@@ -339,11 +393,11 @@ func createTestRoom(t *testing.T, s *Server, owner string, gated bool) string {
 	}
 	ownerCopy := owner
 	room := models.Room{
-		ID:        roomID,
+		ID:         roomID,
 		OwnerLogin: &ownerCopy,
-		Gated:     gated,
-		Ended:     false,
-		CreatedAt: time.Now().UTC(),
+		Gated:      gated,
+		Ended:      false,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if err := s.rooms.CreateRoom(ctx, room); err != nil {
 		t.Fatalf("create test room: %v", err)
