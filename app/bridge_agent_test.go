@@ -363,10 +363,10 @@ func TestRoomStateReportNoControlConn(t *testing.T) {
 // URL, replacing the room path while preserving scheme and host.
 func TestBuildRoomURL(t *testing.T) {
 	cases := []struct {
-		base   string
-		room   string
-		token  string
-		wantPath string
+		base      string
+		room      string
+		token     string
+		wantPath  string
 		wantToken bool
 	}{
 		{"ws://relay.example.com/v1/rooms/old/ws", "new", "", "/v1/rooms/new/ws", false},
@@ -389,5 +389,59 @@ func TestBuildRoomURL(t *testing.T) {
 		if !tc.wantToken && strings.Contains(got, "agent_token") {
 			t.Errorf("buildRoomURL(%q, %q, %q) = %q, unexpected agent_token param", tc.base, tc.room, tc.token, got)
 		}
+	}
+}
+
+// TestRegisterRoomDoesNotStartLoop verifies that registerRoom only creates a
+// map entry and does NOT start a runRoomConn goroutine. This is the regression
+// guard for the legacy (no-token) double-connection bug: joinRoom starts its
+// own connect loop while runWithReconnect simultaneously dials, causing two
+// connections and two readLoops for the same room.
+func TestRegisterRoomDoesNotStartLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &agentEngine{
+		rooms: make(map[string]*roomConn),
+		app:   &BridgeApp{logger: slog.Default()},
+	}
+
+	const roomID = "test-room"
+	e.registerRoom(ctx, roomID)
+
+	// Entry must exist in the map.
+	e.roomsMu.Lock()
+	rc, ok := e.rooms[roomID]
+	e.roomsMu.Unlock()
+	if !ok {
+		t.Fatal("registerRoom: map entry not created")
+	}
+	if rc == nil {
+		t.Fatal("registerRoom: map entry is nil")
+	}
+	if rc.roomID != roomID {
+		t.Fatalf("registerRoom: roomID = %q, want %q", rc.roomID, roomID)
+	}
+
+	// The roomConn must have no active websocket connection — no dial happened.
+	rc.mu.Lock()
+	conn := rc.conn
+	rc.mu.Unlock()
+	if conn != nil {
+		t.Fatal("registerRoom: conn is non-nil; a connection loop was started unexpectedly")
+	}
+
+	// Idempotent: calling again must not panic or duplicate the entry.
+	e.registerRoom(ctx, roomID)
+	e.roomsMu.Lock()
+	count := 0
+	for k := range e.rooms {
+		if k == roomID {
+			count++
+		}
+	}
+	e.roomsMu.Unlock()
+	if count != 1 {
+		t.Fatalf("registerRoom idempotency: entry count = %d, want 1", count)
 	}
 }

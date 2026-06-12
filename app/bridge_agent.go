@@ -184,6 +184,24 @@ func (e *agentEngine) sendRoomStateReport() {
 	}
 }
 
+// registerRoom creates a roomConn entry in the map WITHOUT starting its
+// connection loop. Used by the legacy (no-token) path where runWithReconnect
+// owns the dial/reconnect cycle and serveConn drives presence+readLoop; the
+// map entry is needed so serveConn can look up the rc by room id.
+func (e *agentEngine) registerRoom(ctx context.Context, roomID string) {
+	e.roomsMu.Lock()
+	defer e.roomsMu.Unlock()
+	if _, exists := e.rooms[roomID]; exists {
+		return // idempotent
+	}
+	_, cancel := context.WithCancel(ctx)
+	rc := &roomConn{roomID: roomID, cancel: cancel}
+	if e.rooms == nil {
+		e.rooms = make(map[string]*roomConn)
+	}
+	e.rooms[roomID] = rc
+}
+
 // joinRoom idempotently creates and starts a room connection. Safe to call
 // concurrently (e.g. from both a local -room flag and a join_room directive).
 func (e *agentEngine) joinRoom(ctx context.Context, roomID string) {
