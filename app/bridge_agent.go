@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -19,18 +20,83 @@ import (
 	"agent-room/pkg/id"
 )
 
+// maxPendingOutbound caps the per-room disconnect buffer. A single generation
+// emits dozens of trace events (the worst stuck case we saw had 18), so this
+// leaves ample headroom; on overflow we drop the OLDEST entry, which is always
+// an intermediate trace — the reply and terminal trace are the newest and survive.
+const maxPendingOutbound = 256
+
+// roomConn holds one room's connection state. The agentEngine owns a map of
+// these, one per room currently being served. Each roomConn has its own
+// reconnect loop goroutine and outbound buffer.
+type roomConn struct {
+	roomID string
+
+	mu      sync.Mutex
+	conn    *websocket.Conn      // nil = disconnected
+	pending []models.ChatMessage // outbound buffer while disconnected
+
+	cancel context.CancelFunc // stops this room's reconnect loop
+}
+
+// send writes msg to the room connection, or buffers it while disconnected.
+// gorilla/websocket forbids concurrent writes; all writes to rc.conn serialise
+// under rc.mu.
+func (rc *roomConn) send(msg models.ChatMessage) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.conn == nil {
+		rc.bufferLocked(msg)
+		return
+	}
+	if err := rc.conn.WriteJSON(msg); err != nil {
+		rc.conn = nil
+		rc.bufferLocked(msg)
+	}
+}
+
+func (rc *roomConn) bufferLocked(msg models.ChatMessage) {
+	if len(rc.pending) >= maxPendingOutbound {
+		rc.pending = rc.pending[1:]
+	}
+	rc.pending = append(rc.pending, msg)
+}
+
+// attach installs conn as the write sink and flushes buffered messages.
+func (rc *roomConn) attach(conn *websocket.Conn) {
+	rc.mu.Lock()
+	rc.conn = conn
+	pending := rc.pending
+	rc.pending = nil
+	rc.mu.Unlock()
+
+	for _, msg := range pending {
+		rc.send(msg)
+	}
+}
+
+// detach clears conn when the connection closes, but only if conn still matches
+// (a racing reconnect may have already installed a newer conn).
+func (rc *roomConn) detach(conn *websocket.Conn) {
+	rc.mu.Lock()
+	if rc.conn == conn {
+		rc.conn = nil
+	}
+	rc.mu.Unlock()
+}
+
 // agentEngine owns the agent bridge's generation lifecycle independently of any
 // single websocket connection. A reader goroutine (per connection) classifies
 // inbound messages — dispatching stop signals and queuing reply jobs — while a
 // single long-lived worker goroutine runs replies serially (one `claude -p` at
-// a time). Crucially the worker, the in-flight generation handle, and the
-// pending-permission registry all live here, NOT on the connection: when the
-// websocket drops and reconnects, a running `claude -p` keeps going and its
-// terminal trace (done/stopped/error) plus the final reply are buffered and
-// flushed on reconnect. Before this split a reconnect orphaned the generation —
-// the terminal trace was written to a dead socket and lost, the frontend clock
-// climbed forever, and a later "stop" hit a fresh session that knew nothing of
-// the old generation.
+// a time).
+//
+// Multi-room support: when an agent_token is configured the engine maintains a
+// map of roomConn values, one per room currently joined. Outbound messages are
+// routed by msg.RoomID to the correct roomConn. A separate control connection
+// to /v1/agents/ws receives join_room / leave_room directives from the relay.
+// Without a token the engine behaves exactly as before: a single roomConn,
+// no control connection.
 type agentEngine struct {
 	app       *BridgeApp
 	responder *agent.Responder
@@ -39,17 +105,15 @@ type agentEngine struct {
 	label     string
 	httpBase  string
 
-	// engineCtx is the parent of every generation context. It is cancelled only
-	// when the bridge process shuts down — never by a single connection ending —
-	// so a disconnect does not abort an in-flight reply.
+	// engineCtx is the parent of every generation context. Cancelled only when
+	// the bridge process shuts down, never by a connection ending, so an
+	// in-flight reply survives a reconnect.
 	engineCtx context.Context
 	jobs      chan models.ChatMessage
 
-	// sinkMu guards the swappable write sink and the outbound buffer together.
-	// gorilla/websocket forbids concurrent writers, so all writes serialize here.
-	sinkMu  sync.Mutex
-	conn    *websocket.Conn
-	pending []models.ChatMessage // buffered while disconnected; flushed on attach
+	// roomsMu guards the rooms map.
+	roomsMu sync.Mutex
+	rooms   map[string]*roomConn
 
 	// genMu guards the in-flight generation handle below.
 	genMu          sync.Mutex
@@ -59,53 +123,346 @@ type agentEngine struct {
 	// permMu guards the pending-permission registry below. The reverse
 	// approval channel is the structural mirror of the stop signal: generate()
 	// blocks in a worker goroutine awaiting a decision while readLoop, in
-	// another goroutine, delivers it by permission_id — same concurrency model
-	// as stop cancelling genCtx.
+	// another goroutine, delivers it by permission_id.
 	permMu      sync.Mutex
 	pendingPerm map[string]chan models.PermissionDecision
 
-	// execMu guards the pending-exec-delegation registry below. Structurally
-	// identical to pendingPerm: the delegateExec closure (running in the worker
-	// goroutine) blocks on a channel keyed by command_id while readLoop, in the
-	// connection goroutine, delivers the matching command_result. This is how a
-	// `claude -p` child gets a remote command's result without polling the relay
-	// over HTTP — the bridge already sees the result on its own WebSocket.
+	// execMu guards the pending-exec-delegation registry below.
 	execMu      sync.Mutex
 	pendingExec map[string]chan models.ChatMessage
+
+	// controlMu serialises writes on the control connection.
+	controlMu   sync.Mutex
+	controlConn *websocket.Conn
 }
 
-// maxPendingOutbound caps the disconnect buffer. A single generation emits
-// dozens of trace events (the worst stuck case we saw had 18), so this leaves
-// ample headroom; on overflow we drop the OLDEST entry, which is always an
-// intermediate trace — the reply and terminal trace are the newest and survive.
-const maxPendingOutbound = 256
-
-// send writes a message to the current connection, or buffers it when
-// disconnected so a reconnect can flush it. A mid-write failure means the
-// socket just broke: we drop the sink and buffer the message for next attach,
-// so the reply/terminal trace produced right as a connection dies isn't lost.
+// send routes msg to the roomConn identified by msg.RoomID. If no roomConn
+// exists for that room the message is dropped with a warning (can happen
+// transiently during leave_room).
 func (e *agentEngine) send(msg models.ChatMessage) error {
-	e.sinkMu.Lock()
-	defer e.sinkMu.Unlock()
-	if e.conn == nil {
-		e.bufferLocked(msg)
+	e.roomsMu.Lock()
+	rc := e.rooms[msg.RoomID]
+	e.roomsMu.Unlock()
+	if rc == nil {
+		e.app.logger.Warn("send: no room conn for room; dropping",
+			slog.String("room_id", msg.RoomID))
 		return nil
 	}
-	if err := e.conn.WriteJSON(msg); err != nil {
-		e.conn = nil
-		e.bufferLocked(msg)
-		return nil
-	}
+	rc.send(msg)
 	return nil
 }
 
-// bufferLocked appends to the outbound buffer, dropping the oldest entry when
-// full. Caller must hold sinkMu.
-func (e *agentEngine) bufferLocked(msg models.ChatMessage) {
-	if len(e.pending) >= maxPendingOutbound {
-		e.pending = e.pending[1:]
+// roomIDList returns the current set of room ids as a comma-separated string.
+func (e *agentEngine) roomIDList() string {
+	e.roomsMu.Lock()
+	defer e.roomsMu.Unlock()
+	ids := make([]string, 0, len(e.rooms))
+	for k := range e.rooms {
+		ids = append(ids, k)
 	}
-	e.pending = append(e.pending, msg)
+	return strings.Join(ids, ",")
+}
+
+// sendRoomStateReport sends a room_state_report over the control connection.
+// Safe to call when no control connection is active (no-op).
+func (e *agentEngine) sendRoomStateReport() {
+	rooms := e.roomIDList()
+	msg := models.ChatMessage{
+		Type:       models.MessageTypeControl,
+		SenderID:   e.app.cfg.AgentID,
+		SenderKind: models.SenderKindAgent,
+		CreatedAt:  time.Now().UTC(),
+		Metadata: map[string]string{
+			"operation": models.ControlOperationRoomStateReport,
+			"rooms":     rooms,
+		},
+	}
+	e.controlMu.Lock()
+	defer e.controlMu.Unlock()
+	if e.controlConn != nil {
+		_ = e.controlConn.WriteJSON(msg)
+	}
+}
+
+// registerRoom creates a roomConn entry in the map WITHOUT starting its
+// connection loop. Used by the legacy (no-token) path where runWithReconnect
+// owns the dial/reconnect cycle and serveConn drives presence+readLoop; the
+// map entry is needed so serveConn can look up the rc by room id.
+func (e *agentEngine) registerRoom(ctx context.Context, roomID string) {
+	e.roomsMu.Lock()
+	defer e.roomsMu.Unlock()
+	if _, exists := e.rooms[roomID]; exists {
+		return // idempotent
+	}
+	_, cancel := context.WithCancel(ctx)
+	rc := &roomConn{roomID: roomID, cancel: cancel}
+	if e.rooms == nil {
+		e.rooms = make(map[string]*roomConn)
+	}
+	e.rooms[roomID] = rc
+}
+
+// joinRoom idempotently creates and starts a room connection. Safe to call
+// concurrently (e.g. from both a local -room flag and a join_room directive).
+func (e *agentEngine) joinRoom(ctx context.Context, roomID string) {
+	e.roomsMu.Lock()
+	if _, exists := e.rooms[roomID]; exists {
+		e.roomsMu.Unlock()
+		return // idempotent
+	}
+	roomCtx, cancel := context.WithCancel(ctx)
+	rc := &roomConn{roomID: roomID, cancel: cancel}
+	if e.rooms == nil {
+		e.rooms = make(map[string]*roomConn)
+	}
+	e.rooms[roomID] = rc
+	e.roomsMu.Unlock()
+
+	go e.runRoomConn(roomCtx, rc)
+}
+
+// leaveRoom cancels a room connection loop and removes it from the map.
+func (e *agentEngine) leaveRoom(roomID string) {
+	e.roomsMu.Lock()
+	rc, exists := e.rooms[roomID]
+	if exists {
+		delete(e.rooms, roomID)
+	}
+	e.roomsMu.Unlock()
+	if !exists {
+		return
+	}
+	rc.cancel()
+	rc.mu.Lock()
+	conn := rc.conn
+	rc.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// runRoomConn is the per-room reconnect loop. It mirrors runWithReconnect but
+// constructs a room-specific URL and uses the shared agentEngine as handler.
+func (e *agentEngine) runRoomConn(ctx context.Context, rc *roomConn) {
+	a := e.app
+	roomURL := buildRoomURL(a.cfg.RelayURL, rc.roomID, a.cfg.AgentToken)
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, _, dialErr := websocket.DefaultDialer.DialContext(ctx, roomURL, nil)
+		if dialErr != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			a.logger.Warn("room connect failed; retrying",
+				slog.String("room_id", rc.roomID),
+				slog.Duration("retry_after", backoff),
+				slog.Any("error", dialErr))
+			if !sleepContext(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+		backoff = time.Second
+		a.logger.Info("room connected",
+			slog.String("room_id", rc.roomID),
+			slog.String("agent_id", a.cfg.AgentID))
+
+		rc.attach(conn)
+		stopClose := closeConnOnDone(ctx, conn)
+		stopPing := keepAlive(ctx, conn)
+		err := e.serveRoomConn(ctx, rc.roomID, conn)
+		stopPing()
+		stopClose()
+		rc.detach(conn)
+		_ = conn.Close()
+
+		if ctx.Err() != nil {
+			return
+		}
+		a.logger.Warn("room disconnected; reconnecting",
+			slog.String("room_id", rc.roomID),
+			slog.Duration("retry_after", backoff),
+			slog.Any("error", err))
+		if !sleepContext(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff)
+	}
+}
+
+// buildRoomURL constructs the ws URL for a specific room. It takes the base
+// relay URL (which may already contain a different room path) and replaces the
+// room segment, preserving query params.
+func buildRoomURL(baseRelayURL, roomID, token string) string {
+	u, err := url.Parse(baseRelayURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	}
+	u.Path = "/v1/rooms/" + url.PathEscape(roomID) + "/ws"
+	if token != "" {
+		q := u.Query()
+		q.Set("agent_token", token)
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// agentControlURL builds the control connection URL: /v1/agents/ws with the
+// agent_token, client_id, client_kind, and client_label query params.
+func agentControlURL(baseRelayURL, agentID, label, token string) string {
+	u, err := url.Parse(baseRelayURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	}
+	u.Path = "/v1/agents/ws"
+	q := u.Query()
+	q.Del("agent_token")
+	q.Set("agent_token", token)
+	q.Set("client_id", agentID)
+	q.Set("client_kind", "agent")
+	if label != "" {
+		q.Set("client_label", label)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// runControlConn runs the control connection reconnect loop.
+// It connects to /v1/agents/ws, sends room_state_report on each (re)connect,
+// and processes join_room / leave_room / config_update directives from the relay.
+func (e *agentEngine) runControlConn(ctx context.Context) {
+	a := e.app
+	ctrlURL := agentControlURL(a.cfg.RelayURL, a.cfg.AgentID, e.label, a.cfg.AgentToken)
+	if ctrlURL == "" {
+		a.logger.Warn("control: could not build control URL; skipping")
+		return
+	}
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, _, err := websocket.DefaultDialer.DialContext(ctx, ctrlURL, nil)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			a.logger.Warn("control connect failed; retrying",
+				slog.Duration("retry_after", backoff),
+				slog.Any("error", err))
+			if !sleepContext(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+		backoff = time.Second
+		a.logger.Info("control connected", slog.String("agent_id", a.cfg.AgentID))
+
+		// Register active control connection so sendRoomStateReport can use it.
+		e.controlMu.Lock()
+		e.controlConn = conn
+		e.controlMu.Unlock()
+
+		stopClose := closeConnOnDone(ctx, conn)
+		stopPing := keepAlive(ctx, conn)
+
+		// Report current rooms right after connect.
+		e.sendRoomStateReport()
+
+		// Control read loop.
+		e.readControlLoop(ctx, conn)
+
+		stopPing()
+		stopClose()
+		_ = conn.Close()
+
+		e.controlMu.Lock()
+		if e.controlConn == conn {
+			e.controlConn = nil
+		}
+		e.controlMu.Unlock()
+
+		if ctx.Err() != nil {
+			return
+		}
+		a.logger.Warn("control disconnected; reconnecting",
+			slog.Duration("retry_after", backoff))
+		if !sleepContext(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff)
+	}
+}
+
+// readControlLoop processes messages on the control connection. It handles only
+// join_room, leave_room, and config_update — no room history or chat.Add.
+func (e *agentEngine) readControlLoop(ctx context.Context, conn *websocket.Conn) {
+	a := e.app
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		var msg models.ChatMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			a.logger.Warn("control read error", slog.Any("error", err))
+			return
+		}
+
+		op := strings.TrimSpace(msg.Metadata["operation"])
+		switch op {
+		case models.ControlOperationJoinRoom:
+			roomID := strings.TrimSpace(msg.Metadata["room_id"])
+			if roomID == "" {
+				a.logger.Warn("control: join_room missing room_id")
+				continue
+			}
+			a.logger.Info("control: join_room", slog.String("room_id", roomID))
+			e.joinRoom(ctx, roomID)
+			e.sendRoomStateReport()
+
+		case models.ControlOperationLeaveRoom:
+			roomID := strings.TrimSpace(msg.Metadata["room_id"])
+			if roomID == "" {
+				a.logger.Warn("control: leave_room missing room_id")
+				continue
+			}
+			a.logger.Info("control: leave_room", slog.String("room_id", roomID))
+			e.leaveRoom(roomID)
+			e.sendRoomStateReport()
+
+		case models.ControlOperationConfigUpdate:
+			// Strip api_key before any storage; control conn msgs don't go to chat store.
+			if strings.TrimSpace(msg.Metadata["api_key"]) != "" {
+				msg.Metadata = copyMetadataWithout(msg.Metadata, "api_key")
+			}
+			e.applyConfigUpdate(msg)
+
+		default:
+			a.logger.Debug("control: unknown operation; ignoring", slog.String("op", op))
+		}
+	}
 }
 
 // shouldCancel decides whether a control/stop message targets the in-flight
@@ -166,48 +523,42 @@ func (e *agentEngine) maybeCancel(msg models.ChatMessage) bool {
 
 // registerPermission records a pending approval channel keyed by permission id
 // and returns the receive end. The buffered channel (cap 1) lets resolve land
-// even if generate() is momentarily not selecting yet. Caller must
-// clearPermission(id) when done to avoid leaking the entry.
-func (e *agentEngine) registerPermission(id string) <-chan models.PermissionDecision {
+// even if generate() is momentarily not selecting yet.
+func (e *agentEngine) registerPermission(permID string) <-chan models.PermissionDecision {
 	ch := make(chan models.PermissionDecision, 1)
 	e.permMu.Lock()
 	if e.pendingPerm == nil {
 		e.pendingPerm = make(map[string]chan models.PermissionDecision)
 	}
-	e.pendingPerm[id] = ch
+	e.pendingPerm[permID] = ch
 	e.permMu.Unlock()
 	return ch
 }
 
 // clearPermission removes a pending approval entry. Safe to call repeatedly.
-func (e *agentEngine) clearPermission(id string) {
+func (e *agentEngine) clearPermission(permID string) {
 	e.permMu.Lock()
-	delete(e.pendingPerm, id)
+	delete(e.pendingPerm, permID)
 	e.permMu.Unlock()
 }
 
 // resolvePermission delivers a decision to a waiting RequestPermission closure.
-// Returns true when a matching pending request existed and the decision was
-// accepted; false when no request is waiting on that id (stale/duplicate).
-func (e *agentEngine) resolvePermission(id string, decision models.PermissionDecision) bool {
+// Returns true when a matching pending request existed.
+func (e *agentEngine) resolvePermission(permID string, decision models.PermissionDecision) bool {
 	e.permMu.Lock()
-	ch, ok := e.pendingPerm[id]
+	ch, ok := e.pendingPerm[permID]
 	if ok {
-		delete(e.pendingPerm, id)
+		delete(e.pendingPerm, permID)
 	}
 	e.permMu.Unlock()
 	if !ok {
 		return false
 	}
-	// Channel is buffered (cap 1) and only resolved once, so this never blocks.
 	ch <- decision
 	return true
 }
 
-// registerExec records a pending exec-delegation channel keyed by command id
-// (the id of the command message the bridge just sent) and returns the receive
-// end. Buffered (cap 1) so resolveExec lands even if delegateExec is momentarily
-// not selecting yet. Caller must clearExec(id) when done to avoid leaking.
+// registerExec records a pending exec-delegation channel keyed by command id.
 func (e *agentEngine) registerExec(commandID string) <-chan models.ChatMessage {
 	ch := make(chan models.ChatMessage, 1)
 	e.execMu.Lock()
@@ -226,9 +577,7 @@ func (e *agentEngine) clearExec(commandID string) {
 	e.execMu.Unlock()
 }
 
-// resolveExec delivers a command_result to a waiting delegateExec closure,
-// matched by command_id. Returns true when a matching pending delegation
-// existed; false when none is waiting (stale/duplicate/not ours).
+// resolveExec delivers a command_result to a waiting delegateExec closure.
 func (e *agentEngine) resolveExec(commandID string, result models.ChatMessage) bool {
 	e.execMu.Lock()
 	ch, ok := e.pendingExec[commandID]
@@ -239,31 +588,42 @@ func (e *agentEngine) resolveExec(commandID string, result models.ChatMessage) b
 	if !ok {
 		return false
 	}
-	// Channel is buffered (cap 1) and only resolved once, so this never blocks.
 	ch <- result
 	return true
 }
 
 // start launches the single long-lived worker goroutine. The worker outlives
-// individual connections, draining e.jobs under engineCtx, so a generation keeps
-// running across a reconnect. Call once before the first serveConn.
+// individual connections, draining e.jobs under engineCtx.
 func (e *agentEngine) start() {
 	e.jobs = make(chan models.ChatMessage, 8)
 	go e.worker()
 }
 
-// serveConn drives one websocket connection: it installs the conn as the engine's
-// write sink (flushing any traces buffered while disconnected), announces
-// presence, re-seeds history, then runs the read loop. On return — i.e. when the
-// connection drops — it detaches the sink WITHOUT cancelling any in-flight
-// generation, so the running reply survives to be flushed on the next connection.
+// serveConn is the legacy single-room entry point used when no agent_token is
+// configured. It wraps serveRoomConn using the configured cfg.RoomID.
 func (e *agentEngine) serveConn(ctx context.Context, conn *websocket.Conn) error {
 	a := e.app
-	e.attach(conn)
-	defer e.detach(conn)
+	// In legacy (no-token) mode the engine has exactly one roomConn which was
+	// created by runAgent before the first connect. We need to attach/detach it.
+	e.roomsMu.Lock()
+	rc := e.rooms[a.cfg.RoomID]
+	e.roomsMu.Unlock()
+	if rc == nil {
+		// Should not happen; guard defensively.
+		return errors.New("serveConn: no roomConn for legacy room")
+	}
+	rc.attach(conn)
+	defer rc.detach(conn)
+	return e.serveRoomConn(ctx, a.cfg.RoomID, conn)
+}
 
-	if err := e.send(models.ChatMessage{
-		RoomID:     a.cfg.RoomID,
+// serveRoomConn handles one websocket connection for a given room: sends
+// presence, seeds history, then runs the read loop.
+func (e *agentEngine) serveRoomConn(ctx context.Context, roomID string, conn *websocket.Conn) error {
+	a := e.app
+
+	if err := conn.WriteJSON(models.ChatMessage{
+		RoomID:     roomID,
 		Type:       models.MessageTypePresence,
 		SenderID:   a.cfg.AgentID,
 		SenderKind: models.SenderKindAgent,
@@ -280,46 +640,16 @@ func (e *agentEngine) serveConn(ctx context.Context, conn *websocket.Conn) error
 		return err
 	}
 
-	// Seed local history from the relay so a freshly (re)connected bridge
-	// remembers the room instead of starting blank. Best-effort.
-	a.seedRoomHistory(ctx, e.chat, e.httpBase)
+	// Seed local history from the relay. Best-effort.
+	a.seedRoomHistory(ctx, e.chat, e.httpBase, roomID)
 
-	return e.readLoop(ctx, conn)
+	return e.readLoop(ctx, roomID, conn)
 }
 
-// attach installs conn as the write sink and flushes any messages buffered while
-// disconnected (terminal traces and the reply produced during the gap), in order.
-func (e *agentEngine) attach(conn *websocket.Conn) {
-	e.sinkMu.Lock()
-	e.conn = conn
-	pending := e.pending
-	e.pending = nil
-	e.sinkMu.Unlock()
-
-	for _, msg := range pending {
-		// Best-effort flush; if this conn also breaks, send() re-buffers.
-		_ = e.send(msg)
-	}
-}
-
-// detach clears the sink when its connection ends, but only if conn is still the
-// active one (a racing reconnect may have already swapped in a newer conn). It
-// does NOT touch the in-flight generation: the worker and its `claude -p` keep
-// running, and their output buffers until the next attach.
-func (e *agentEngine) detach(conn *websocket.Conn) {
-	e.sinkMu.Lock()
-	if e.conn == conn {
-		e.conn = nil
-	}
-	e.sinkMu.Unlock()
-}
-
-// readLoop reads inbound messages from this connection's conn, stores them, and
-// either dispatches a stop signal to the in-flight generation or queues a reply
-// job on the engine. It returns when the connection closes or ctx is done. It
-// reads from the conn passed in (not e.conn) so a racing reconnect swapping the
-// write sink can't redirect this reader.
-func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error {
+// readLoop reads inbound messages from conn, stores them, and dispatches stop
+// signals or queues reply jobs. It returns when the connection closes or ctx
+// is done.
+func (e *agentEngine) readLoop(ctx context.Context, roomID string, conn *websocket.Conn) error {
 	a := e.app
 	for {
 		select {
@@ -335,9 +665,8 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 			}
 			return err
 		}
-		// A config_update carries a plaintext api_key on this targeted channel.
-		// Keep it out of the (in-memory) local store: strip it from the stored
-		// copy so it can never surface in local history dumps or logging.
+
+		// Strip api_key before storing.
 		stored := msg
 		if msg.Type == models.MessageTypeControl &&
 			strings.TrimSpace(msg.Metadata["operation"]) == models.ControlOperationConfigUpdate &&
@@ -348,9 +677,6 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 			a.logger.Warn("store incoming message failed", slog.Any("error", err))
 		}
 
-		// Control messages addressed to us carry out-of-band signals: stop
-		// interrupts the in-flight reply; permission_reply feeds an approval
-		// decision back to a blocked RequestPermission closure.
 		if msg.Type == models.MessageTypeControl && msg.IsAddressedTo(a.cfg.AgentID) {
 			switch strings.TrimSpace(msg.Metadata["operation"]) {
 			case models.ControlOperationConfigUpdate:
@@ -385,12 +711,6 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 			continue
 		}
 
-		// A command_result addressed to us carries the output of a command we
-		// delegated to an executor peer. Route it by command_id to the blocked
-		// delegateExec closure; this is the bridge-mediated alternative to the
-		// agent polling the relay over HTTP. Non-delegated results (none pending
-		// for that id) fall through harmlessly — they're already stored above and
-		// ShouldReply ignores command_result anyway.
 		if msg.Type == models.MessageTypeCommandResult && msg.IsAddressedTo(a.cfg.AgentID) {
 			cmdID := strings.TrimSpace(msg.Metadata["command_id"])
 			if cmdID != "" && e.resolveExec(cmdID, msg) {
@@ -407,30 +727,73 @@ func (e *agentEngine) readLoop(ctx context.Context, conn *websocket.Conn) error 
 			continue
 		}
 
-		// Non-blocking enqueue: the web composer locks while awaiting a reply,
-		// so the queue should not back up. If it does, drop and warn rather
-		// than stall the reader (which would also stall stop handling).
-		select {
-		case e.jobs <- msg:
-		default:
-			a.logger.Warn("reply queue full; dropping message",
-				slog.String("room_id", msg.RoomID), slog.String("from", msg.SenderID))
+		// Non-blocking enqueue with queue-feedback: inform the sender if busy
+		// or the queue is full, rather than silently dropping.
+		e.enqueueWithFeedback(msg)
+	}
+}
+
+// enqueueWithFeedback attempts to queue msg for the worker. If the worker is
+// currently busy it sends a "queued" trace to the originating room. If the
+// queue is full it sends a "queue full" trace and drops the message.
+func (e *agentEngine) enqueueWithFeedback(msg models.ChatMessage) {
+	a := e.app
+
+	// Check whether the worker is currently busy.
+	e.genMu.Lock()
+	busy := e.currentReplyTo != ""
+	queueLen := len(e.jobs)
+	e.genMu.Unlock()
+
+	select {
+	case e.jobs <- msg:
+		if busy {
+			// Worker has something in flight; tell the sender they are queued.
+			_ = e.send(models.ChatMessage{
+				RoomID:     msg.RoomID,
+				Type:       models.MessageTypeTrace,
+				SenderID:   a.cfg.AgentID,
+				SenderKind: models.SenderKindAgent,
+				TargetID:   msg.SenderID,
+				Content:    "已排队（前方还有 " + strconv.Itoa(queueLen+1) + " 个请求）",
+				CreatedAt:  time.Now().UTC(),
+				Metadata: map[string]string{
+					"phase":    "queued",
+					"reply_to": msg.ID,
+					"provider": e.provider.Name(),
+					"label":    e.label,
+				},
+			})
 		}
+	default:
+		a.logger.Warn("reply queue full; dropping message",
+			slog.String("room_id", msg.RoomID), slog.String("from", msg.SenderID))
+		_ = e.send(models.ChatMessage{
+			RoomID:     msg.RoomID,
+			Type:       models.MessageTypeTrace,
+			SenderID:   a.cfg.AgentID,
+			SenderKind: models.SenderKindAgent,
+			TargetID:   msg.SenderID,
+			Content:    "请求队列已满，请稍后重试",
+			CreatedAt:  time.Now().UTC(),
+			Metadata: map[string]string{
+				"phase":    "queue_full",
+				"reply_to": msg.ID,
+				"provider": e.provider.Name(),
+				"label":    e.label,
+			},
+		})
 	}
 }
 
 // runtimeConfigurable is implemented by providers that accept a server-pushed
-// startup config (model / api base url / api key) at runtime. Only the Claude
-// provider needs it today; others simply don't implement it and config_update
-// becomes a no-op for them.
+// startup config (model / api base url / api key) at runtime.
 type runtimeConfigurable interface {
 	ApplyServerConfig(model, apiBaseURL, apiKey string)
 }
 
 // applyConfigUpdate applies a relay config_update control message to the local
-// provider's in-memory runtime config. The new values take effect on the next
-// reply (each spawns a fresh `claude -p`); nothing is persisted to disk and the
-// api key is never logged.
+// provider's in-memory runtime config.
 func (e *agentEngine) applyConfigUpdate(msg models.ChatMessage) {
 	configurable, ok := e.provider.(runtimeConfigurable)
 	if !ok {
@@ -450,7 +813,7 @@ func (e *agentEngine) applyConfigUpdate(msg models.ChatMessage) {
 }
 
 // copyMetadataWithout returns a shallow copy of metadata with the named key
-// removed. Used to strip a plaintext secret before storing a message.
+// removed.
 func copyMetadataWithout(metadata map[string]string, drop string) map[string]string {
 	out := make(map[string]string, len(metadata))
 	for k, v := range metadata {
@@ -462,9 +825,7 @@ func copyMetadataWithout(metadata map[string]string, drop string) map[string]str
 	return out
 }
 
-// worker runs queued replies one at a time, for the lifetime of the engine
-// (across reconnects). Each generation gets its own cancelable context
-// registered as the in-flight handle so a stop signal can interrupt it.
+// worker runs queued replies one at a time, for the lifetime of the engine.
 func (e *agentEngine) worker() {
 	for {
 		select {
@@ -500,15 +861,9 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 		slog.Int("summary_chars", len(roomSummary)),
 	)
 	startedAt := time.Now().UTC()
-	// e.send never errors (it buffers while disconnected), so generation always
-	// proceeds even if no connection is currently attached.
 	_ = e.send(e.trace(msg, "thinking", "thinking", startedAt, nil))
 
 	onEvent := func(ev models.ProviderEvent) {
-		// Permission requests are surfaced by the requestPermission closure
-		// below, which owns the permission_id <-> pending-channel mapping. The
-		// generic trace path skips them so a provider that also emits this
-		// event can't produce a duplicate, id-less approval card.
 		if ev.Type == models.ProviderEventPermissionRequest {
 			return
 		}
@@ -529,11 +884,6 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 		}
 	}
 
-	// requestPermission is the reverse channel mirror of onEvent: it surfaces a
-	// permission_request trace to the room, then blocks the in-flight
-	// generation until readLoop delivers a decision (control/permission_reply)
-	// or genCtx is cancelled (e.g. a stop signal). nil-RequestPermission
-	// providers never call this and keep the old auto-allow behavior.
 	requestPermission := func(ctx context.Context, p models.PermissionRequest) (models.PermissionDecision, error) {
 		permID := strings.TrimSpace(p.RequestID)
 		if permID == "" {
@@ -558,8 +908,6 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 		if err := e.send(e.trace(msg, "permission_request", "permission requested", time.Now().UTC(), extra)); err != nil {
 			a.logger.Warn("write permission request failed", slog.Any("error", err))
 		}
-		// Log the ask with tool/input so the later "delivered" line (which only
-		// has the permission_id) can be correlated back to what was approved.
 		askedAt := time.Now()
 		a.logger.Info("permission requested",
 			slog.String("room_id", msg.RoomID),
@@ -571,8 +919,6 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 
 		select {
 		case <-ctx.Done():
-			// Context cancelled (stop or connection teardown) while awaiting
-			// approval: surface as an interruption so the provider can abort.
 			a.logger.Info("permission wait aborted",
 				slog.String("room_id", msg.RoomID),
 				slog.String("permission_id", permID),
@@ -592,12 +938,6 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 		}
 	}
 
-	// delegateExec lets the provider hand a shell command to an executor peer and
-	// block for its result, replacing the agent's HTTP poll loop. We mint the
-	// command id up front so we can register the pending channel BEFORE sending,
-	// closing the race where the result could arrive before we start waiting. The
-	// command goes out over the bridge's own WS; the relay stamps the recipient's
-	// exec_token onto it (relay-mediated), so we never handle the token here.
 	delegateExec := func(ctx context.Context, dreq models.DelegateExecRequest) (models.DelegateExecResult, error) {
 		target := strings.TrimSpace(dreq.TargetID)
 		command := strings.TrimSpace(dreq.Command)
@@ -633,8 +973,6 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 		if err := e.send(cmdMsg); err != nil {
 			return models.DelegateExecResult{}, err
 		}
-		// Surface a room-visible trace so the timeline shows the agent dispatching
-		// a remote command, mirroring the permission_request card.
 		_ = e.send(e.trace(msg, "delegate_exec", "delegating command to "+target, time.Now().UTC(), map[string]string{
 			"command_id": commandID,
 			"target":     target,
@@ -655,8 +993,6 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 		return
 	}
 	reply.Metadata["duration_ms"] = strconv.FormatInt(time.Since(startedAt).Milliseconds(), 10)
-	// e.send buffers if disconnected, so the reply and its done trace survive a
-	// reconnect rather than vanishing into a dead socket.
 	_ = e.send(reply)
 	a.logger.Info("reply sent",
 		slog.String("room_id", msg.RoomID),
@@ -669,9 +1005,7 @@ func (e *agentEngine) generate(msg models.ChatMessage) {
 	_ = e.send(e.trace(msg, "done", "done", time.Now().UTC(), doneMeta))
 }
 
-// handleReplyError turns a failed generation into the right trace: a
-// deliberate stop becomes phase="stopped" (not an error), anything else
-// becomes phase="error" carrying the message.
+// handleReplyError turns a failed generation into the right trace.
 func (e *agentEngine) handleReplyError(msg models.ChatMessage, err error, startedAt time.Time) {
 	a := e.app
 	if errors.Is(err, models.ErrProviderInterrupted) {
@@ -688,12 +1022,8 @@ func (e *agentEngine) handleReplyError(msg models.ChatMessage, err error, starte
 	_ = e.send(e.trace(msg, "error", "reply failed", time.Now().UTC(), map[string]string{"error": err.Error()}))
 }
 
-// delegateResultFrom parses an executor's command_result message into a
-// DelegateExecResult. The executor encodes exit_code/timed_out/truncation flags
-// as string metadata (see executor.baseMetadata) and renders the combined
-// stdout+stderr into the message Content (formatResult). Missing/garbage fields
-// degrade to zero values rather than erroring — the agent still gets a usable
-// (if partial) result.
+// delegateResultFrom parses an executor command_result message into a
+// DelegateExecResult.
 func delegateResultFrom(msg models.ChatMessage) models.DelegateExecResult {
 	res := models.DelegateExecResult{
 		Output:    msg.Content,
@@ -710,8 +1040,7 @@ func delegateResultFrom(msg models.ChatMessage) models.DelegateExecResult {
 	return res
 }
 
-// trace builds a trace ChatMessage for the given phase, carrying the common
-// reply_to/provider/label metadata plus any phase-specific extras.
+// trace builds a trace ChatMessage for the given phase.
 func (e *agentEngine) trace(src models.ChatMessage, phase, content string, at time.Time, extra map[string]string) models.ChatMessage {
 	meta := map[string]string{
 		"phase":    phase,
@@ -736,15 +1065,12 @@ func (e *agentEngine) trace(src models.ChatMessage, phase, content string, at ti
 	}
 }
 
-// splitPatterns parses the pattern list an approver picked on the permission
-// card (control metadata.patterns): JSON array first (multi-line patterns),
-// newline-joined fallback. See models.EncodePatternList.
+// splitPatterns parses the pattern list an approver picked on the permission card.
 func splitPatterns(raw string) []string {
 	return models.DecodePatternList(raw)
 }
 
-// truncateForLog caps a string for structured-log fields so a huge tool input
-// can't flood the bridge log.
+// truncateForLog caps a string for structured-log fields.
 func truncateForLog(s string, limit int) string {
 	if len(s) <= limit {
 		return s

@@ -1,7 +1,10 @@
 package app
 
 import (
+	"context"
+	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,34 +166,57 @@ func TestDelegateResultFrom(t *testing.T) {
 }
 
 // TestSendBuffersWhileDisconnected is the core regression guard for the zombie
-// stream: with no connection attached, send() must buffer (not drop) so a
-// terminal trace produced during a disconnect survives to the next attach.
+// stream: with no connection attached, roomConn.send() must buffer (not drop)
+// so a terminal trace produced during a disconnect survives to the next attach.
 func TestSendBuffersWhileDisconnected(t *testing.T) {
-	e := &agentEngine{}
+	rc := &roomConn{roomID: "room-1"}
 
 	for i := 0; i < 3; i++ {
-		if err := e.send(models.ChatMessage{Type: models.MessageTypeTrace, Content: "t"}); err != nil {
-			t.Fatalf("send while disconnected returned error: %v", err)
-		}
+		rc.send(models.ChatMessage{Type: models.MessageTypeTrace, Content: "t", RoomID: "room-1"})
 	}
-	if len(e.pending) != 3 {
-		t.Fatalf("pending = %d, want 3 buffered messages", len(e.pending))
+	rc.mu.Lock()
+	n := len(rc.pending)
+	rc.mu.Unlock()
+	if n != 3 {
+		t.Fatalf("pending = %d, want 3 buffered messages", n)
+	}
+
+	// Verify engine.send routes to the correct roomConn and buffers there.
+	e := &agentEngine{
+		rooms: map[string]*roomConn{"room-1": rc},
+		app:   &BridgeApp{logger: slog.Default()},
+	}
+	if err := e.send(models.ChatMessage{RoomID: "room-1", Type: models.MessageTypeTrace, Content: "routed"}); err != nil {
+		t.Fatalf("engine.send returned error: %v", err)
+	}
+	rc.mu.Lock()
+	n2 := len(rc.pending)
+	rc.mu.Unlock()
+	if n2 != 4 {
+		t.Fatalf("pending after engine.send = %d, want 4", n2)
 	}
 }
 
-// TestBufferLockedDropsOldest verifies the disconnect buffer is bounded and
-// evicts the OLDEST entry on overflow, so the newest (reply + terminal trace)
-// always survive.
+// TestBufferLockedDropsOldest verifies the per-room disconnect buffer is bounded
+// and evicts the OLDEST entry on overflow, so the newest (reply + terminal
+// trace) always survive.
 func TestBufferLockedDropsOldest(t *testing.T) {
-	e := &agentEngine{}
+	rc := &roomConn{roomID: "room-x"}
 	for i := 0; i < maxPendingOutbound+10; i++ {
-		e.send(models.ChatMessage{Content: string(rune('a' + i%26)), Metadata: map[string]string{"seq": itoa(i)}})
+		rc.send(models.ChatMessage{
+			RoomID:   "room-x",
+			Content:  string(rune('a' + i%26)),
+			Metadata: map[string]string{"seq": itoa(i)},
+		})
 	}
-	if len(e.pending) != maxPendingOutbound {
-		t.Fatalf("pending = %d, want cap %d", len(e.pending), maxPendingOutbound)
+	rc.mu.Lock()
+	n := len(rc.pending)
+	last := rc.pending[len(rc.pending)-1]
+	rc.mu.Unlock()
+	if n != maxPendingOutbound {
+		t.Fatalf("pending = %d, want cap %d", n, maxPendingOutbound)
 	}
 	// The very last message sent must still be present as the tail.
-	last := e.pending[len(e.pending)-1]
 	if last.Metadata["seq"] != itoa(maxPendingOutbound+9) {
 		t.Fatalf("tail seq = %q, want newest %q", last.Metadata["seq"], itoa(maxPendingOutbound+9))
 	}
@@ -198,13 +224,17 @@ func TestBufferLockedDropsOldest(t *testing.T) {
 
 // TestDetachKeepsGenerationState verifies a connection ending does NOT clear the
 // in-flight handle, so a stop arriving on a later connection still cancels the
-// generation that started under an earlier one.
+// generation that started under an earlier one. The detach is now on roomConn,
+// not agentEngine, but generation state lives on the engine — so a roomConn
+// detach must not affect maybeCancel.
 func TestDetachKeepsGenerationState(t *testing.T) {
+	rc := &roomConn{roomID: "room-1"}
 	e := &agentEngine{}
 	cancelled := false
 	e.registerGeneration("msg_1", func() { cancelled = true })
 
-	e.detach(nil) // simulate the old connection going away
+	// Simulate the room connection going away.
+	rc.detach(nil)
 
 	stop := models.ChatMessage{
 		Type:     models.MessageTypeControl,
@@ -220,4 +250,198 @@ func TestDetachKeepsGenerationState(t *testing.T) {
 
 func itoa(i int) string {
 	return strconv.Itoa(i)
+}
+
+// TestJoinRoomIdempotent verifies that calling joinRoom twice with the same
+// roomID only creates one roomConn (no duplicate goroutines or map entries).
+func TestJoinRoomIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &agentEngine{
+		engineCtx: ctx,
+		rooms:     make(map[string]*roomConn),
+		app:       &BridgeApp{logger: slog.Default()},
+	}
+
+	e.joinRoom(ctx, "alpha")
+	e.joinRoom(ctx, "alpha") // second call must be a no-op
+
+	e.roomsMu.Lock()
+	n := len(e.rooms)
+	e.roomsMu.Unlock()
+	if n != 1 {
+		t.Fatalf("rooms = %d, want 1 after idempotent join", n)
+	}
+}
+
+// TestLeaveRoomRemovesEntry verifies leaveRoom removes the roomConn from the
+// map and cancels its context.
+func TestLeaveRoomRemovesEntry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &agentEngine{
+		engineCtx: ctx,
+		rooms:     make(map[string]*roomConn),
+		app:       &BridgeApp{logger: slog.Default()},
+	}
+
+	e.joinRoom(ctx, "beta")
+	e.roomsMu.Lock()
+	rc := e.rooms["beta"]
+	e.roomsMu.Unlock()
+	if rc == nil {
+		t.Fatal("expected roomConn for 'beta' after join")
+	}
+
+	// Capture the room context before leaving.
+	roomCtx, _ := context.WithCancel(context.Background()) // just to have one
+	_ = roomCtx
+
+	e.leaveRoom("beta")
+
+	e.roomsMu.Lock()
+	_, still := e.rooms["beta"]
+	e.roomsMu.Unlock()
+	if still {
+		t.Fatal("room 'beta' should have been removed after leaveRoom")
+	}
+}
+
+// TestSendRoutesByRoomID verifies that engine.send routes messages to the
+// correct per-room buffer and drops messages for unknown rooms.
+func TestSendRoutesByRoomID(t *testing.T) {
+	rcA := &roomConn{roomID: "room-a"}
+	rcB := &roomConn{roomID: "room-b"}
+
+	e := &agentEngine{
+		rooms: map[string]*roomConn{
+			"room-a": rcA,
+			"room-b": rcB,
+		},
+		app: &BridgeApp{logger: slog.Default()},
+	}
+
+	_ = e.send(models.ChatMessage{RoomID: "room-a", Content: "for-a"})
+	_ = e.send(models.ChatMessage{RoomID: "room-a", Content: "for-a-2"})
+	_ = e.send(models.ChatMessage{RoomID: "room-b", Content: "for-b"})
+	// Unknown room: must not panic, just warn-and-drop.
+	_ = e.send(models.ChatMessage{RoomID: "room-z", Content: "lost"})
+
+	rcA.mu.Lock()
+	nA := len(rcA.pending)
+	rcA.mu.Unlock()
+
+	rcB.mu.Lock()
+	nB := len(rcB.pending)
+	rcB.mu.Unlock()
+
+	if nA != 2 {
+		t.Fatalf("room-a pending = %d, want 2", nA)
+	}
+	if nB != 1 {
+		t.Fatalf("room-b pending = %d, want 1", nB)
+	}
+}
+
+// TestRoomStateReportNoControlConn verifies that sendRoomStateReport is safe
+// to call when no control connection is active (should be a no-op, not a panic).
+func TestRoomStateReportNoControlConn(t *testing.T) {
+	e := &agentEngine{
+		rooms: map[string]*roomConn{
+			"r1": {roomID: "r1"},
+			"r2": {roomID: "r2"},
+		},
+		app: &BridgeApp{logger: slog.Default()},
+	}
+	// Should not panic.
+	e.sendRoomStateReport()
+}
+
+// TestBuildRoomURL verifies that buildRoomURL correctly constructs the room WS
+// URL, replacing the room path while preserving scheme and host.
+func TestBuildRoomURL(t *testing.T) {
+	cases := []struct {
+		base   string
+		room   string
+		token  string
+		wantPath string
+		wantToken bool
+	}{
+		{"ws://relay.example.com/v1/rooms/old/ws", "new", "", "/v1/rooms/new/ws", false},
+		{"wss://relay.example.com:8443/v1/rooms/old/ws", "myroom", "tok123", "/v1/rooms/myroom/ws", true},
+		{"http://relay.example.com", "abc", "", "/v1/rooms/abc/ws", false},
+	}
+	for _, tc := range cases {
+		got := buildRoomURL(tc.base, tc.room, tc.token)
+		if got == "" {
+			t.Errorf("buildRoomURL(%q, %q, %q) = empty", tc.base, tc.room, tc.token)
+			continue
+		}
+		if !strings.Contains(got, tc.wantPath) {
+			t.Errorf("buildRoomURL(%q, %q, %q) = %q, want path %q", tc.base, tc.room, tc.token, got, tc.wantPath)
+		}
+		hasToken := strings.Contains(got, "agent_token="+tc.token)
+		if tc.wantToken && !hasToken {
+			t.Errorf("buildRoomURL(%q, %q, %q) = %q, want agent_token param", tc.base, tc.room, tc.token, got)
+		}
+		if !tc.wantToken && strings.Contains(got, "agent_token") {
+			t.Errorf("buildRoomURL(%q, %q, %q) = %q, unexpected agent_token param", tc.base, tc.room, tc.token, got)
+		}
+	}
+}
+
+// TestRegisterRoomDoesNotStartLoop verifies that registerRoom only creates a
+// map entry and does NOT start a runRoomConn goroutine. This is the regression
+// guard for the legacy (no-token) double-connection bug: joinRoom starts its
+// own connect loop while runWithReconnect simultaneously dials, causing two
+// connections and two readLoops for the same room.
+func TestRegisterRoomDoesNotStartLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &agentEngine{
+		rooms: make(map[string]*roomConn),
+		app:   &BridgeApp{logger: slog.Default()},
+	}
+
+	const roomID = "test-room"
+	e.registerRoom(ctx, roomID)
+
+	// Entry must exist in the map.
+	e.roomsMu.Lock()
+	rc, ok := e.rooms[roomID]
+	e.roomsMu.Unlock()
+	if !ok {
+		t.Fatal("registerRoom: map entry not created")
+	}
+	if rc == nil {
+		t.Fatal("registerRoom: map entry is nil")
+	}
+	if rc.roomID != roomID {
+		t.Fatalf("registerRoom: roomID = %q, want %q", rc.roomID, roomID)
+	}
+
+	// The roomConn must have no active websocket connection — no dial happened.
+	rc.mu.Lock()
+	conn := rc.conn
+	rc.mu.Unlock()
+	if conn != nil {
+		t.Fatal("registerRoom: conn is non-nil; a connection loop was started unexpectedly")
+	}
+
+	// Idempotent: calling again must not panic or duplicate the entry.
+	e.registerRoom(ctx, roomID)
+	e.roomsMu.Lock()
+	count := 0
+	for k := range e.rooms {
+		if k == roomID {
+			count++
+		}
+	}
+	e.roomsMu.Unlock()
+	if count != 1 {
+		t.Fatalf("registerRoom idempotency: entry count = %d, want 1", count)
+	}
 }

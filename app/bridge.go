@@ -188,8 +188,37 @@ func (a *BridgeApp) runAgent(ctx context.Context) error {
 		label:     label,
 		httpBase:  httpBase,
 		engineCtx: ctx,
+		rooms:     make(map[string]*roomConn),
 	}
 	engine.start()
+
+	hasToken := strings.TrimSpace(a.cfg.AgentToken) != ""
+
+	if hasToken {
+		// Token mode: start the control connection, which will receive
+		// join_room / leave_room directives from the relay.
+		go engine.runControlConn(ctx)
+
+		// If -room was also provided, self-join it immediately (relay will
+		// reconcile via room_state_report).
+		if strings.TrimSpace(a.cfg.RoomID) != "" {
+			engine.joinRoom(ctx, a.cfg.RoomID)
+		}
+
+		// Block until the process shuts down.
+		<-ctx.Done()
+		return nil
+	}
+
+	// Legacy (no-token) mode: single room, no control connection. Behavior is
+	// identical to before this change.
+	// registerRoom (not joinRoom) only creates the map entry without starting a
+	// connection goroutine — the dial/reconnect cycle is owned by runWithReconnect
+	// below, and serveConn drives presence + readLoop on each connection. Using
+	// joinRoom here would start runRoomConn (connection #1) while runWithReconnect
+	// simultaneously dials a second connection — causing duplicate presence and
+	// double-handling of every inbound message.
+	engine.registerRoom(ctx, a.cfg.RoomID)
 	return a.runWithReconnect(ctx, "agent", func(ctx context.Context, conn *websocket.Conn) error {
 		return engine.serveConn(ctx, conn)
 	})
@@ -407,7 +436,7 @@ func (a *BridgeApp) loadContextFile() string {
 // preserve the bridge's anonymous-first, weak-dependency behavior. The
 // memory store dedupes by message ID, so re-seeding on every reconnect is
 // idempotent.
-func (a *BridgeApp) seedRoomHistory(ctx context.Context, chatService *chat.Service, httpBase string) {
+func (a *BridgeApp) seedRoomHistory(ctx context.Context, chatService *chat.Service, httpBase, roomID string) {
 	if httpBase == "" {
 		return
 	}
@@ -415,9 +444,9 @@ func (a *BridgeApp) seedRoomHistory(ctx context.Context, chatService *chat.Servi
 	if limit <= 0 {
 		limit = 100
 	}
-	history, err := fetchRoomHistory(ctx, httpBase, a.cfg.RoomID, limit)
+	history, err := fetchRoomHistory(ctx, httpBase, roomID, limit)
 	if err != nil {
-		a.logger.Warn("seed room history failed", slog.String("room_id", a.cfg.RoomID), slog.Any("error", err))
+		a.logger.Warn("seed room history failed", slog.String("room_id", roomID), slog.Any("error", err))
 		return
 	}
 	for _, msg := range history {
@@ -427,7 +456,7 @@ func (a *BridgeApp) seedRoomHistory(ctx context.Context, chatService *chat.Servi
 	}
 	stats := summarizeHistory(history)
 	a.logger.Info("seeded room history",
-		slog.String("room_id", a.cfg.RoomID),
+		slog.String("room_id", roomID),
 		slog.Int("messages", stats.Total),
 		slog.String("by_type", stats.ByType),
 		slog.String("oldest_age", stats.OldestAge),
